@@ -204,6 +204,183 @@ class subVPSDE(SDE):
     return -N / 2. * np.log(2 * np.pi) - torch.sum(z ** 2, dim=(1, 2, 3)) / 2.
 
 
+class FoxVPSDE(SDE):
+  """Variance-preserving-style SDE induced by the exact Fox reduction.
+
+  The forward process uses a constant linear drift and a time-dependent
+  effective diffusion coefficient obtained from the chosen colored-noise
+  kernel:
+
+    dx = u x dt + sqrt(2 D_eff(t)) dW_t
+
+  Marginals remain Gaussian, so the rest of the score-matching pipeline can
+  reuse the standard continuous-time VP path.
+  """
+
+  def __init__(self,
+               u=-0.5,
+               diffusion_scale=1.0,
+               kernel='gaussian',
+               gaussian_sigma=0.35,
+               power_law_alpha=1.5,
+               power_law_tau0=0.2,
+               matern_length_scale=0.3,
+               schedule_grid_size=4096,
+               target_terminal_variance=None,
+               N=1000):
+    super().__init__(N)
+    if schedule_grid_size < 2:
+      raise ValueError('schedule_grid_size must be at least 2.')
+
+    self.u = float(u)
+    self.diffusion_scale = float(diffusion_scale)
+    self.kernel = self._normalize_kernel_name(kernel)
+    self.gaussian_sigma = float(gaussian_sigma)
+    self.power_law_alpha = float(power_law_alpha)
+    self.power_law_tau0 = float(power_law_tau0)
+    self.matern_length_scale = float(matern_length_scale)
+    self.schedule_grid_size = int(schedule_grid_size)
+    self.target_terminal_variance = target_terminal_variance
+    self.N = N
+
+    self._validate_params()
+    self._build_schedule_cache()
+
+  @property
+  def T(self):
+    return 1
+
+  def _normalize_kernel_name(self, kernel):
+    normalized = kernel.lower()
+    if normalized == 'ou':
+      return 'matern_1_2'
+    return normalized
+
+  def _validate_params(self):
+    if self.diffusion_scale <= 0.0:
+      raise ValueError('diffusion_scale must be positive.')
+    if self.kernel not in ('gaussian', 'power_law', 'matern_1_2'):
+      raise ValueError('Unsupported kernel: %s' % self.kernel)
+    if self.gaussian_sigma <= 0.0:
+      raise ValueError('gaussian_sigma must be positive.')
+    if self.power_law_alpha <= 0.0:
+      raise ValueError('power_law_alpha must be positive.')
+    if self.power_law_tau0 <= 0.0:
+      raise ValueError('power_law_tau0 must be positive.')
+    if self.matern_length_scale <= 0.0:
+      raise ValueError('matern_length_scale must be positive.')
+    if self.target_terminal_variance is not None and self.target_terminal_variance <= 0.0:
+      raise ValueError('target_terminal_variance must be positive.')
+
+  def _kernel_correlation_np(self, tau):
+    if self.kernel == 'gaussian':
+      return self.diffusion_scale * np.exp(-(tau ** 2) / (2.0 * self.gaussian_sigma ** 2))
+    if self.kernel == 'power_law':
+      return self.diffusion_scale / ((1.0 + tau / self.power_law_tau0) ** self.power_law_alpha)
+    if self.kernel == 'matern_1_2':
+      return self.diffusion_scale * np.exp(-tau / self.matern_length_scale)
+    raise ValueError('Unsupported kernel: %s' % self.kernel)
+
+  # TODO check numpy realization
+  def _cumulative_trapezoid_np(self, x, y):
+    integral = np.zeros_like(y)
+    if y.size <= 1:
+      return integral
+    dx = np.diff(x)
+    trapezoids = 0.5 * (y[1:] + y[:-1]) * dx
+    integral[1:] = np.cumsum(trapezoids)
+    return integral
+
+  def _build_schedule_cache(self):
+    times = np.linspace(0.0, self.T, self.schedule_grid_size, dtype=np.float64)
+    kernel_correlation = self._kernel_correlation_np(times)
+    effective_diffusion_integrand = kernel_correlation * np.exp(self.u * times)
+    effective_diffusion = self._cumulative_trapezoid_np(times, effective_diffusion_integrand)
+
+    variance_integrand = effective_diffusion * np.exp(-2.0 * self.u * times)
+    variance = 2.0 * np.exp(2.0 * self.u * times) * self._cumulative_trapezoid_np(times, variance_integrand)
+
+    if self.target_terminal_variance is not None:
+      terminal_variance = variance[-1]
+      if terminal_variance <= 0.0:
+        raise ValueError('Terminal variance must be positive for normalization.')
+      scale = self.target_terminal_variance / terminal_variance
+      self.diffusion_scale *= scale
+      effective_diffusion *= scale
+      variance *= scale
+
+    variance = np.maximum(variance, 0.0)
+    effective_diffusion = np.maximum(effective_diffusion, 0.0)
+
+    # TODO check
+    self._schedule_times_cpu = torch.from_numpy(times.astype(np.float64))
+    self._effective_diffusion_cpu = torch.from_numpy(effective_diffusion.astype(np.float64))
+    self._variance_cpu = torch.from_numpy(variance.astype(np.float64))
+    self._schedule_cache = {}
+    self._prior_variance = float(variance[-1])
+    self._prior_std = float(np.sqrt(self._prior_variance))
+
+  def _cached_schedule(self, t):
+    key = (t.device.type, t.device.index, t.dtype)
+    cached = self._schedule_cache.get(key)
+    if cached is None:
+      cached = (
+        self._schedule_times_cpu.to(device=t.device, dtype=t.dtype),
+        self._effective_diffusion_cpu.to(device=t.device, dtype=t.dtype),
+        self._variance_cpu.to(device=t.device, dtype=t.dtype),
+      )
+      self._schedule_cache[key] = cached
+    return cached
+
+  def _interpolate(self, t, values):
+    schedule_times, _, _ = self._cached_schedule(t)
+    t = torch.clamp(t, 0.0, self.T)
+    indices = torch.searchsorted(schedule_times, t)
+    indices = torch.clamp(indices, 1, schedule_times.shape[0] - 1)
+    left = indices - 1
+    right = indices
+
+    t0 = schedule_times[left]
+    t1 = schedule_times[right]
+    v0 = values[left]
+    v1 = values[right]
+    weight = (t - t0) / (t1 - t0)
+    return v0 + weight * (v1 - v0)
+
+  def mean_coeff(self, t):
+    return torch.exp(self.u * t)
+
+  def effective_diffusion(self, t):
+    _, effective_diffusion, _ = self._cached_schedule(t)
+    return self._interpolate(t, effective_diffusion)
+
+  def marginal_variance(self, t):
+    _, _, variance = self._cached_schedule(t)
+    return torch.clamp(self._interpolate(t, variance), min=0.0)
+
+  def sde(self, x, t):
+    drift = self.u * x
+    diffusion = torch.sqrt(torch.clamp(2.0 * self.effective_diffusion(t), min=0.0))
+    return drift, diffusion
+
+  def marginal_prob(self, x, t):
+    mean = self.mean_coeff(t)[:, None, None, None] * x
+    std = torch.sqrt(self.marginal_variance(t))
+    return mean, std
+
+  def prior_sampling(self, shape):
+    return torch.randn(*shape) * self._prior_std
+
+  def prior_logp(self, z):
+    if self._prior_variance <= 0.0:
+      raise ValueError('Prior variance must be positive.')
+    shape = z.shape
+    N = np.prod(shape[1:])
+    quadratic = torch.sum(z ** 2, dim=tuple(range(1, len(shape)))) / (2.0 * self._prior_variance)
+    normalizer = -N / 2.0 * np.log(2 * np.pi * self._prior_variance)
+    return normalizer - quadratic
+
+
 class VESDE(SDE):
   def __init__(self, sigma_min=0.01, sigma_max=50, N=1000):
     """Construct a Variance Exploding SDE.

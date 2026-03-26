@@ -44,6 +44,42 @@ from utils import save_checkpoint, restore_checkpoint
 FLAGS = flags.FLAGS
 
 
+def get_sde(config):
+  sde_name = config.training.sde.lower()
+  if sde_name == 'vpsde':
+    return sde_lib.VPSDE(
+      beta_min=config.model.beta_min,
+      beta_max=config.model.beta_max,
+      N=config.model.num_scales,
+    ), 1e-3
+  if sde_name == 'subvpsde':
+    return sde_lib.subVPSDE(
+      beta_min=config.model.beta_min,
+      beta_max=config.model.beta_max,
+      N=config.model.num_scales,
+    ), 1e-3
+  if sde_name == 'vesde':
+    return sde_lib.VESDE(
+      sigma_min=config.model.sigma_min,
+      sigma_max=config.model.sigma_max,
+      N=config.model.num_scales,
+    ), 1e-5
+  if sde_name == 'foxvpsde':
+    return sde_lib.FoxVPSDE(
+      u=config.model.fox_u,
+      diffusion_scale=config.model.fox_diffusion_scale,
+      kernel=config.model.fox_kernel,
+      gaussian_sigma=config.model.fox_gaussian_sigma,
+      power_law_alpha=config.model.fox_power_law_alpha,
+      power_law_tau0=config.model.fox_power_law_tau0,
+      matern_length_scale=config.model.fox_matern_length_scale,
+      schedule_grid_size=config.model.fox_schedule_grid_size,
+      target_terminal_variance=getattr(config.model, 'fox_target_terminal_variance', None),
+      N=config.model.num_scales,
+    ), 1e-3
+  raise NotImplementedError(f"SDE {config.training.sde} unknown.")
+
+
 def train(config, workdir):
   """Runs the training pipeline.
 
@@ -87,17 +123,7 @@ def train(config, workdir):
   inverse_scaler = datasets.get_data_inverse_scaler(config)
 
   # Setup SDEs
-  if config.training.sde.lower() == 'vpsde':
-    sde = sde_lib.VPSDE(beta_min=config.model.beta_min, beta_max=config.model.beta_max, N=config.model.num_scales)
-    sampling_eps = 1e-3
-  elif config.training.sde.lower() == 'subvpsde':
-    sde = sde_lib.subVPSDE(beta_min=config.model.beta_min, beta_max=config.model.beta_max, N=config.model.num_scales)
-    sampling_eps = 1e-3
-  elif config.training.sde.lower() == 'vesde':
-    sde = sde_lib.VESDE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max, N=config.model.num_scales)
-    sampling_eps = 1e-5
-  else:
-    raise NotImplementedError(f"SDE {config.training.sde} unknown.")
+  sde, sampling_eps = get_sde(config)
 
   # Build one-step training and evaluation functions
   optimize_fn = losses.optimization_manager(config)
@@ -205,17 +231,7 @@ def evaluate(config,
   checkpoint_dir = os.path.join(workdir, "checkpoints")
 
   # Setup SDEs
-  if config.training.sde.lower() == 'vpsde':
-    sde = sde_lib.VPSDE(beta_min=config.model.beta_min, beta_max=config.model.beta_max, N=config.model.num_scales)
-    sampling_eps = 1e-3
-  elif config.training.sde.lower() == 'subvpsde':
-    sde = sde_lib.subVPSDE(beta_min=config.model.beta_min, beta_max=config.model.beta_max, N=config.model.num_scales)
-    sampling_eps = 1e-3
-  elif config.training.sde.lower() == 'vesde':
-    sde = sde_lib.VESDE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max, N=config.model.num_scales)
-    sampling_eps = 1e-5
-  else:
-    raise NotImplementedError(f"SDE {config.training.sde} unknown.")
+  sde, sampling_eps = get_sde(config)
 
   # Create the one-step evaluation function when loss computation is enabled
   if config.eval.enable_loss:
