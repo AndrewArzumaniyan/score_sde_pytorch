@@ -21,7 +21,18 @@ import io
 import os
 import time
 
+import torch
+from torch.utils import tensorboard
+from torchvision.utils import make_grid, save_image
 import numpy as np
+
+# In mixed TensorFlow/PyTorch environments (notably WSL with older TF stacks),
+# importing TensorFlow before PyTorch lazily initializes CUDA can trigger
+# `RuntimeError: random_device could not be read: File exists` on the first
+# `.to("cuda")`. Initialize CUDA eagerly while Torch still owns startup.
+if torch.cuda.is_available():
+  torch.cuda.init()
+
 import tensorflow as tf
 import tensorflow_gan as tfgan
 import logging
@@ -36,9 +47,6 @@ import evaluation
 import likelihood
 import sde_lib
 from absl import flags
-import torch
-from torch.utils import tensorboard
-from torchvision.utils import make_grid, save_image
 from utils import save_checkpoint, restore_checkpoint
 
 FLAGS = flags.FLAGS

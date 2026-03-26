@@ -15,6 +15,13 @@
 
 """Training and evaluation"""
 
+import torch
+
+# See the matching note in run_lib.py: initialize CUDA before TensorFlow is
+# imported to avoid mixed TF/PyTorch startup failures on some WSL setups.
+if torch.cuda.is_available():
+  torch.cuda.init()
+
 import run_lib
 from absl import app
 from absl import flags
