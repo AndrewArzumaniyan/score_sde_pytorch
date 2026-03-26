@@ -15,12 +15,16 @@
 
 """Utility functions for computing FID/Inception scores."""
 
-import jax
 import numpy as np
 import six
 import tensorflow as tf
 import tensorflow_gan as tfgan
 import tensorflow_hub as tfhub
+
+try:
+  import jax
+except ImportError:
+  jax = None
 
 INCEPTION_TFHUB = 'https://tfhub.dev/tensorflow/tfgan/eval/inception/1'
 INCEPTION_OUTPUT = 'logits'
@@ -121,11 +125,14 @@ def run_inception_distributed(input_tensor,
     A dictionary with key `pool_3` and `logits`, representing the pool_3 and
       logits of the inception network respectively.
   """
-  num_tpus = jax.local_device_count()
+  num_tpus = jax.local_device_count() if jax is not None else 1
   input_tensors = tf.split(input_tensor, num_tpus, axis=0)
   pool3 = []
   logits = [] if not inceptionv3 else None
-  device_format = '/TPU:{}' if 'TPU' in str(jax.devices()[0]) else '/GPU:{}'
+  if jax is None:
+    device_format = '/CPU:{}'
+  else:
+    device_format = '/TPU:{}' if 'TPU' in str(jax.devices()[0]) else '/GPU:{}'
   for i, tensor in enumerate(input_tensors):
     with tf.device(device_format.format(i)):
       tensor_on_device = tf.identity(tensor)
