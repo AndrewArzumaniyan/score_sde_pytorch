@@ -254,12 +254,14 @@ class FoxVPSDE(SDE):
     normalized = kernel.lower()
     if normalized == 'ou':
       return 'matern_1_2'
+    if normalized in ('matern32', 'matern3/2'):
+      return 'matern_3_2'
     return normalized
 
   def _validate_params(self):
     if self.diffusion_scale <= 0.0:
       raise ValueError('diffusion_scale must be positive.')
-    if self.kernel not in ('gaussian', 'power_law', 'matern_1_2'):
+    if self.kernel not in ('gaussian', 'power_law', 'matern_1_2', 'matern_3_2'):
       raise ValueError('Unsupported kernel: %s' % self.kernel)
     if self.gaussian_sigma <= 0.0:
       raise ValueError('gaussian_sigma must be positive.')
@@ -279,9 +281,11 @@ class FoxVPSDE(SDE):
       return self.diffusion_scale / ((1.0 + tau / self.power_law_tau0) ** self.power_law_alpha)
     if self.kernel == 'matern_1_2':
       return self.diffusion_scale * np.exp(-tau / self.matern_length_scale)
+    if self.kernel == 'matern_3_2':
+      scaled_tau = np.sqrt(3.0) * tau / self.matern_length_scale
+      return self.diffusion_scale * (1.0 + scaled_tau) * np.exp(-scaled_tau)
     raise ValueError('Unsupported kernel: %s' % self.kernel)
 
-  # TODO check numpy realization
   def _cumulative_trapezoid_np(self, x, y):
     integral = np.zeros_like(y)
     if y.size <= 1:
@@ -312,10 +316,9 @@ class FoxVPSDE(SDE):
     variance = np.maximum(variance, 0.0)
     effective_diffusion = np.maximum(effective_diffusion, 0.0)
 
-    # TODO check
-    self._schedule_times_cpu = torch.from_numpy(times.astype(np.float64))
-    self._effective_diffusion_cpu = torch.from_numpy(effective_diffusion.astype(np.float64))
-    self._variance_cpu = torch.from_numpy(variance.astype(np.float64))
+    self._schedule_times_cpu = torch.from_numpy(times)
+    self._effective_diffusion_cpu = torch.from_numpy(effective_diffusion)
+    self._variance_cpu = torch.from_numpy(variance)
     self._schedule_cache = {}
     self._prior_variance = float(variance[-1])
     self._prior_std = float(np.sqrt(self._prior_variance))
