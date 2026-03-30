@@ -1,4 +1,5 @@
 import os
+import warnings
 
 import torch
 from torch import nn
@@ -8,13 +9,22 @@ from torch.utils.cpp_extension import load
 
 
 module_path = os.path.dirname(__file__)
-fused = load(
-    "fused",
-    sources=[
-        os.path.join(module_path, "fused_bias_act.cpp"),
-        os.path.join(module_path, "fused_bias_act_kernel.cu"),
-    ],
-)
+try:
+    fused = load(
+        "fused",
+        sources=[
+            os.path.join(module_path, "fused_bias_act.cpp"),
+            os.path.join(module_path, "fused_bias_act_kernel.cu"),
+        ],
+    )
+except (OSError, RuntimeError) as error:
+    fused = None
+    warnings.warn(
+        "Fused bias activation extension is unavailable; falling back to the "
+        "native PyTorch implementation. This is expected on systems without "
+        "a local CUDA toolkit / MSVC build chain and is slower but functional. "
+        "Original error: %s" % error
+    )
 
 
 class FusedLeakyReLUFunctionBackward(Function):
@@ -84,11 +94,11 @@ class FusedLeakyReLU(nn.Module):
 
 
 def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2 ** 0.5):
-    if input.device.type == "cpu":
+    if fused is None or input.device.type == "cpu":
         rest_dim = [1] * (input.ndim - bias.ndim - 1)
         return (
             F.leaky_relu(
-                input + bias.view(1, bias.shape[0], *rest_dim), negative_slope=0.2
+                input + bias.view(1, bias.shape[0], *rest_dim), negative_slope=negative_slope
             )
             * scale
         )

@@ -18,6 +18,16 @@ All combined, we achieved an FID of **2.20** and an Inception score of **9.89** 
 
 ![FFHQ samples](assets/ffhq_samples.jpg)
 
+## Local extension
+
+This repository was extended by **Arzumanyan Andrey** and **Kovshov Ilya** with a Fox-style colored-noise forward process for diffusion models.
+
+In this fork we:
+
+- added an exact Fox-reduced `FoxVPSDE` with constant linear drift and colored-noise kernels: Gaussian, Power-law, Mat\'ern $1/2$, and Mat\'ern $3/2$;
+- integrated the new SDE into the continuous training and sampling pipeline with dedicated CIFAR-10 configs;
+- added practical runtime compatibility fixes used in experiments, including fallbacks for custom CUDA ops and mixed TensorFlow/PyTorch startup issues.
+
 ## What does this code do?
 Aside from the **NCSN++** and **DDPM++** models in our paper, this codebase also re-implements many previous score-based models in one place, including **NCSN** from [Generative Modeling by Estimating Gradients of the Data Distribution](https://arxiv.org/abs/1907.05600), **NCSNv2** from [Improved Techniques for Training Score-Based Generative Models](https://arxiv.org/abs/2006.09011), and **DDPM** from [Denoising Diffusion Probabilistic Models](https://arxiv.org/abs/2006.11239). 
 
@@ -186,4 +196,3 @@ This work is built upon some previous papers which might also interest you:
 * Song, Yang, and Stefano Ermon. "Generative Modeling by Estimating Gradients of the Data Distribution." *Proceedings of the 33rd Annual Conference on Neural Information Processing Systems*. 2019.
 * Song, Yang, and Stefano Ermon. "Improved techniques for training score-based generative models." *Proceedings of the 34th Annual Conference on Neural Information Processing Systems*. 2020.
 * Ho, Jonathan, Ajay Jain, and Pieter Abbeel. "Denoising diffusion probabilistic models." *Proceedings of the 34th Annual Conference on Neural Information Processing Systems*. 2020.
-
