@@ -1,0 +1,17 @@
+.git
+__pycache__
+*.pyc
+.pytest_cache
+.cache
+.tfds
+.torch_extensions
+.miniforge3
+.conda*
+results
+tmp
+workdirs
+artifacts
+build
+dist
+*.egg-info
+.DS_Store
