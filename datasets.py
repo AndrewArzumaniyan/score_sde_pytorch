@@ -15,6 +15,8 @@
 
 # pylint: skip-file
 """Return training and evaluation/test datasets from config files."""
+import os
+
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
@@ -94,10 +96,11 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
   shuffle_buffer_size = 10000
   prefetch_size = tf.data.experimental.AUTOTUNE
   num_epochs = None if not evaluation else 1
+  tfds_data_dir = os.environ.get('TFDS_DATA_DIR')
 
   # Create dataset builders for each dataset.
   if config.data.dataset == 'CIFAR10':
-    dataset_builder = tfds.builder('cifar10')
+    dataset_builder = tfds.builder('cifar10', data_dir=tfds_data_dir)
     train_split_name = 'train'
     eval_split_name = 'test'
 
@@ -106,7 +109,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
       return tf.image.resize(img, [config.data.image_size, config.data.image_size], antialias=True)
 
   elif config.data.dataset == 'SVHN':
-    dataset_builder = tfds.builder('svhn_cropped')
+    dataset_builder = tfds.builder('svhn_cropped', data_dir=tfds_data_dir)
     train_split_name = 'train'
     eval_split_name = 'test'
 
@@ -115,7 +118,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
       return tf.image.resize(img, [config.data.image_size, config.data.image_size], antialias=True)
 
   elif config.data.dataset == 'CELEBA':
-    dataset_builder = tfds.builder('celeb_a')
+    dataset_builder = tfds.builder('celeb_a', data_dir=tfds_data_dir)
     train_split_name = 'train'
     eval_split_name = 'validation'
 
@@ -126,7 +129,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
       return img
 
   elif config.data.dataset == 'LSUN':
-    dataset_builder = tfds.builder(f'lsun/{config.data.category}')
+    dataset_builder = tfds.builder(f'lsun/{config.data.category}', data_dir=tfds_data_dir)
     train_split_name = 'train'
     eval_split_name = 'validation'
 
