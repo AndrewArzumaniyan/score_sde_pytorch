@@ -15,11 +15,17 @@
 
 """Utility functions for computing FID/Inception scores."""
 
+import gc
+import io
+import os
+
 import numpy as np
 import six
 import tensorflow as tf
+import tensorflow_datasets as tfds
 import tensorflow_gan as tfgan
 import tensorflow_hub as tfhub
+from absl import logging
 
 try:
   import jax
@@ -44,16 +50,62 @@ def get_inception_model(inceptionv3=False):
     return tfhub.load(INCEPTION_TFHUB)
 
 
-def load_dataset_stats(config):
-  """Load the pre-computed dataset statistics."""
+def _get_stats_filename(config):
+  """Return the dataset statistics path for the configured dataset."""
   if config.data.dataset == 'CIFAR10':
-    filename = 'assets/stats/cifar10_stats.npz'
+    return 'assets/stats/cifar10_stats.npz'
   elif config.data.dataset == 'CELEBA':
-    filename = 'assets/stats/celeba_stats.npz'
+    return 'assets/stats/celeba_stats.npz'
   elif config.data.dataset == 'LSUN':
-    filename = f'assets/stats/lsun_{config.data.category}_{config.data.image_size}_stats.npz'
+    return f'assets/stats/lsun_{config.data.category}_{config.data.image_size}_stats.npz'
   else:
     raise ValueError(f'Dataset {config.data.dataset} stats not found.')
+
+
+def _compute_cifar10_stats(filename, inception_model, batch_size):
+  """Compute and persist CIFAR-10 pool_3 statistics from the TFDS train split."""
+  tfds_data_dir = os.environ.get('TFDS_DATA_DIR')
+  ds = tfds.load(
+    'cifar10',
+    split='train',
+    data_dir=tfds_data_dir,
+    shuffle_files=False)
+  ds = ds.map(lambda example: example['image'],
+              num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  ds = ds.batch(batch_size)
+  ds = ds.prefetch(tf.data.experimental.AUTOTUNE)
+
+  pools = []
+  total = 0
+  for batch in ds:
+    gc.collect()
+    latents = run_inception_distributed(batch, inception_model)
+    gc.collect()
+    pools.append(latents['pool_3'].numpy())
+    total += int(batch.shape[0])
+    logging.info('Computed CIFAR-10 dataset stats for %d examples', total)
+
+  tf.io.gfile.makedirs(os.path.dirname(filename))
+  pool_3 = np.concatenate(pools, axis=0)
+  with tf.io.gfile.GFile(filename, 'wb') as fout:
+    io_buffer = io.BytesIO()
+    np.savez_compressed(io_buffer, pool_3=pool_3)
+    fout.write(io_buffer.getvalue())
+
+
+def load_dataset_stats(config, inception_model=None):
+  """Load pre-computed dataset statistics, computing CIFAR-10 stats if needed."""
+  filename = _get_stats_filename(config)
+  if not tf.io.gfile.exists(filename):
+    if config.data.dataset != 'CIFAR10':
+      raise FileNotFoundError(
+        f'Dataset stats file {filename} does not exist. '
+        'Download or compute it before evaluation.')
+    logging.info('Dataset stats file %s not found. Computing it from TFDS.', filename)
+    if inception_model is None:
+      inception_model = get_inception_model()
+    batch_size = getattr(getattr(config, 'eval', None), 'batch_size', 512)
+    _compute_cifar10_stats(filename, inception_model, batch_size)
 
   with tf.io.gfile.GFile(filename, 'rb') as fin:
     stats = np.load(fin)

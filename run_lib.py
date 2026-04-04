@@ -353,23 +353,29 @@ def evaluate(config,
     # Generate samples and compute IS/FID/KID when enabled
     if config.eval.enable_sampling:
       num_sampling_rounds = config.eval.num_samples // config.eval.batch_size + 1
+      this_sample_dir = os.path.join(eval_dir, f"ckpt_{ckpt}")
+      tf.io.gfile.makedirs(this_sample_dir)
       for r in range(num_sampling_rounds):
-        logging.info("sampling -- ckpt: %d, round: %d" % (ckpt, r))
+        sample_file = os.path.join(this_sample_dir, f"samples_{r}.npz")
+        stat_file = os.path.join(this_sample_dir, f"statistics_{r}.npz")
+        if tf.io.gfile.exists(stat_file):
+          logging.info("sampling -- ckpt: %d, round: %d (reuse statistics)" % (ckpt, r))
+          continue
 
-        # Directory to save samples. Different for each host to avoid writing conflicts
-        this_sample_dir = os.path.join(
-          eval_dir, f"ckpt_{ckpt}")
-        tf.io.gfile.makedirs(this_sample_dir)
-        samples, n = sampling_fn(score_model)
-        samples = np.clip(samples.permute(0, 2, 3, 1).cpu().numpy() * 255., 0, 255).astype(np.uint8)
-        samples = samples.reshape(
-          (-1, config.data.image_size, config.data.image_size, config.data.num_channels))
-        # Write samples to disk or Google Cloud Storage
-        with tf.io.gfile.GFile(
-            os.path.join(this_sample_dir, f"samples_{r}.npz"), "wb") as fout:
-          io_buffer = io.BytesIO()
-          np.savez_compressed(io_buffer, samples=samples)
-          fout.write(io_buffer.getvalue())
+        logging.info("sampling -- ckpt: %d, round: %d" % (ckpt, r))
+        if tf.io.gfile.exists(sample_file):
+          with tf.io.gfile.GFile(sample_file, "rb") as fin:
+            samples = np.load(fin)["samples"]
+        else:
+          samples, n = sampling_fn(score_model)
+          samples = np.clip(samples.permute(0, 2, 3, 1).cpu().numpy() * 255., 0, 255).astype(np.uint8)
+          samples = samples.reshape(
+            (-1, config.data.image_size, config.data.image_size, config.data.num_channels))
+          # Write samples to disk or Google Cloud Storage
+          with tf.io.gfile.GFile(sample_file, "wb") as fout:
+            io_buffer = io.BytesIO()
+            np.savez_compressed(io_buffer, samples=samples)
+            fout.write(io_buffer.getvalue())
 
         # Force garbage collection before calling TensorFlow code for Inception network
         gc.collect()
@@ -378,8 +384,7 @@ def evaluate(config,
         # Force garbage collection again before returning to JAX code
         gc.collect()
         # Save latent represents of the Inception network to disk or Google Cloud Storage
-        with tf.io.gfile.GFile(
-            os.path.join(this_sample_dir, f"statistics_{r}.npz"), "wb") as fout:
+        with tf.io.gfile.GFile(stat_file, "wb") as fout:
           io_buffer = io.BytesIO()
           np.savez_compressed(
             io_buffer, pool_3=latents["pool_3"], logits=latents["logits"])
@@ -403,7 +408,7 @@ def evaluate(config,
       all_pools = np.concatenate(all_pools, axis=0)[:config.eval.num_samples]
 
       # Load pre-computed dataset statistics.
-      data_stats = evaluation.load_dataset_stats(config)
+      data_stats = evaluation.load_dataset_stats(config, inception_model=inception_model)
       data_pools = data_stats["pool_3"]
 
       # Compute FID/KID/IS on all samples together.
