@@ -319,9 +319,15 @@ class FoxVPSDE(SDE):
     self._schedule_times_cpu = torch.from_numpy(times)
     self._effective_diffusion_cpu = torch.from_numpy(effective_diffusion)
     self._variance_cpu = torch.from_numpy(variance)
+    # Expose the cached variance under an explicit name for sanity checks/debugging.
+    self.sigma2_grid = self._variance_cpu
     self._schedule_cache = {}
     self._prior_variance = float(variance[-1])
     self._prior_std = float(np.sqrt(self._prior_variance))
+
+    if self.kernel == 'gaussian':
+      assert torch.all(self.sigma2_grid >= 0), "sigma2 < 0 detected!"
+      assert torch.isfinite(self.sigma2_grid).all(), "NaN/Inf in sigma2!"
 
   def _cached_schedule(self, t):
     key = (t.device.type, t.device.index, t.dtype)
