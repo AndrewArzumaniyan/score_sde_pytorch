@@ -242,9 +242,9 @@ def evaluate(config,
   # Setup SDEs. Keep the training SDE for loss/BPD, but allow eval-only
   # sampling to use a different number of discretization steps.
   sde, sampling_eps = get_sde(config)
-  sampling_num_scales = getattr(config.eval, 'sampling_num_scales', None)
+  sampling_num_scales = getattr(config.eval, 'sampling_num_scales', 0)
   sampling_sde = sde
-  if sampling_num_scales is not None:
+  if sampling_num_scales and sampling_num_scales > 0:
     sampling_sde, sampling_eps = get_sde(config, n_override=sampling_num_scales)
 
   # Create the one-step evaluation function when loss computation is enabled
