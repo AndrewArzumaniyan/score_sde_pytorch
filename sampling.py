@@ -115,6 +115,7 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
                                  probability_flow=config.sampling.probability_flow,
                                  continuous=config.training.continuous,
                                  denoise=config.sampling.noise_removal,
+                                 time_grid=config.sampling.time_grid,
                                  eps=eps,
                                  device=config.device)
   else:
@@ -354,7 +355,7 @@ def shared_corrector_update_fn(x, t, sde, model, corrector, continuous, snr, n_s
 
 def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
                    n_steps=1, probability_flow=False, continuous=False,
-                   denoise=True, eps=1e-3, device='cuda'):
+                   denoise=True, time_grid='uniform_time', eps=1e-3, device='cuda'):
   """Create a Predictor-Corrector (PC) sampler.
 
   Args:
@@ -387,6 +388,11 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
                                           snr=snr,
                                           n_steps=n_steps)
 
+  def get_time_grid():
+    if isinstance(sde, sde_lib.FoxVPSDE):
+      return sde.sampling_time_grid(eps, grid=time_grid, device=device, dtype=torch.float32)
+    return torch.linspace(sde.T, eps, sde.N, device=device)
+
   def pc_sampler(model):
     """ The PC sampler funciton.
 
@@ -398,7 +404,7 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
     with torch.no_grad():
       # Initial sample
       x = sde.prior_sampling(shape).to(device)
-      timesteps = torch.linspace(sde.T, eps, sde.N, device=device)
+      timesteps = get_time_grid()
 
       for i in range(sde.N):
         t = timesteps[i]

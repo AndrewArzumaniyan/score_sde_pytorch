@@ -367,6 +367,43 @@ class FoxVPSDE(SDE):
     _, _, variance = self._cached_schedule(t)
     return torch.clamp(self._interpolate(t, variance), min=0.0)
 
+  def sampling_time_grid(self, eps, grid='uniform_time', device=None, dtype=None, N=None):
+    """Build reverse-time sampling grids for Fox-aware discretization."""
+    num_steps = self.N if N is None else N
+    if device is None:
+      device = self._schedule_times_cpu.device
+    if dtype is None:
+      dtype = self._schedule_times_cpu.dtype
+
+    if grid == 'uniform_time':
+      return torch.linspace(self.T, eps, num_steps, device=device, dtype=dtype)
+    if grid != 'uniform_variance':
+      raise ValueError(f'Unsupported Fox sampling grid: {grid}')
+
+    schedule_times = self._schedule_times_cpu.to(device=device, dtype=dtype)
+    variance = self._variance_cpu.to(device=device, dtype=dtype)
+    eps_tensor = torch.tensor([eps], device=device, dtype=dtype)
+    eps_variance = self.marginal_variance(eps_tensor)[0]
+    terminal_variance = variance[-1]
+    target_variances = torch.linspace(
+      terminal_variance.item(), eps_variance.item(), num_steps, device=device, dtype=dtype)
+
+    indices = torch.searchsorted(variance, target_variances)
+    indices = torch.clamp(indices, 1, variance.shape[0] - 1)
+    left = indices - 1
+    right = indices
+
+    v0 = variance[left]
+    v1 = variance[right]
+    t0 = schedule_times[left]
+    t1 = schedule_times[right]
+    denom = torch.clamp(v1 - v0, min=torch.finfo(dtype).eps)
+    weights = (target_variances - v0) / denom
+    timesteps = t0 + weights * (t1 - t0)
+    timesteps[0] = torch.tensor(self.T, device=device, dtype=dtype)
+    timesteps[-1] = torch.tensor(eps, device=device, dtype=dtype)
+    return timesteps
+
   def sde(self, x, t):
     drift = self.u * x
     diffusion = torch.sqrt(torch.clamp(2.0 * self.effective_diffusion(t), min=0.0))

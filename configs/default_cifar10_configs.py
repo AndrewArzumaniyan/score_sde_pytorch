@@ -25,6 +25,7 @@ def get_default_configs():
   sampling.noise_removal = True
   sampling.probability_flow = False
   sampling.snr = 0.16
+  sampling.time_grid = 'uniform_time'
 
   # evaluation
   config.eval = evaluate = ml_collections.ConfigDict()
