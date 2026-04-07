@@ -52,25 +52,26 @@ from utils import save_checkpoint, restore_checkpoint
 FLAGS = flags.FLAGS
 
 
-def get_sde(config):
+def get_sde(config, n_override=None):
+  num_scales = config.model.num_scales if n_override is None else n_override
   sde_name = config.training.sde.lower()
   if sde_name == 'vpsde':
     return sde_lib.VPSDE(
       beta_min=config.model.beta_min,
       beta_max=config.model.beta_max,
-      N=config.model.num_scales,
+      N=num_scales,
     ), 1e-3
   if sde_name == 'subvpsde':
     return sde_lib.subVPSDE(
       beta_min=config.model.beta_min,
       beta_max=config.model.beta_max,
-      N=config.model.num_scales,
+      N=num_scales,
     ), 1e-3
   if sde_name == 'vesde':
     return sde_lib.VESDE(
       sigma_min=config.model.sigma_min,
       sigma_max=config.model.sigma_max,
-      N=config.model.num_scales,
+      N=num_scales,
     ), 1e-5
   if sde_name == 'foxvpsde':
     return sde_lib.FoxVPSDE(
@@ -83,7 +84,7 @@ def get_sde(config):
       matern_length_scale=config.model.fox_matern_length_scale,
       schedule_grid_size=config.model.fox_schedule_grid_size,
       target_terminal_variance=getattr(config.model, 'fox_target_terminal_variance', None),
-      N=config.model.num_scales,
+      N=num_scales,
     ), 1e-3
   raise NotImplementedError(f"SDE {config.training.sde} unknown.")
 
@@ -238,8 +239,13 @@ def evaluate(config,
 
   checkpoint_dir = os.path.join(workdir, "checkpoints")
 
-  # Setup SDEs
+  # Setup SDEs. Keep the training SDE for loss/BPD, but allow eval-only
+  # sampling to use a different number of discretization steps.
   sde, sampling_eps = get_sde(config)
+  sampling_num_scales = getattr(config.eval, 'sampling_num_scales', None)
+  sampling_sde = sde
+  if sampling_num_scales is not None:
+    sampling_sde, sampling_eps = get_sde(config, n_override=sampling_num_scales)
 
   # Create the one-step evaluation function when loss computation is enabled
   if config.eval.enable_loss:
@@ -276,7 +282,7 @@ def evaluate(config,
     sampling_shape = (config.eval.batch_size,
                       config.data.num_channels,
                       config.data.image_size, config.data.image_size)
-    sampling_fn = sampling.get_sampling_fn(config, sde, sampling_shape, inverse_scaler, sampling_eps)
+    sampling_fn = sampling.get_sampling_fn(config, sampling_sde, sampling_shape, inverse_scaler, sampling_eps)
 
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
