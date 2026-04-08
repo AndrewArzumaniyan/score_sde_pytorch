@@ -179,12 +179,15 @@ class EulerMaruyamaPredictor(Predictor):
   def __init__(self, sde, score_fn, probability_flow=False):
     super().__init__(sde, score_fn, probability_flow)
 
-  def update_fn(self, x, t):
-    dt = -1. / self.rsde.N
+  def update_fn(self, x, t, dt=None):
+    if dt is None:
+      dt = torch.tensor(-1. / self.rsde.N, device=t.device, dtype=t.dtype)
+    elif not torch.is_tensor(dt):
+      dt = torch.tensor(dt, device=t.device, dtype=t.dtype)
     z = torch.randn_like(x)
     drift, diffusion = self.rsde.sde(x, t)
     x_mean = x + drift * dt
-    x = x_mean + diffusion[:, None, None, None] * np.sqrt(-dt) * z
+    x = x_mean + diffusion[:, None, None, None] * torch.sqrt(-dt) * z
     return x, x_mean
 
 
@@ -331,7 +334,7 @@ class NoneCorrector(Corrector):
     return x, x
 
 
-def shared_predictor_update_fn(x, t, sde, model, predictor, probability_flow, continuous):
+def shared_predictor_update_fn(x, t, sde, model, predictor, probability_flow, continuous, dt=None):
   """A wrapper that configures and returns the update function of predictors."""
   score_fn = mutils.get_score_fn(sde, model, train=False, continuous=continuous)
   if predictor is None:
@@ -339,6 +342,8 @@ def shared_predictor_update_fn(x, t, sde, model, predictor, probability_flow, co
     predictor_obj = NonePredictor(sde, score_fn, probability_flow)
   else:
     predictor_obj = predictor(sde, score_fn, probability_flow)
+  if isinstance(predictor_obj, EulerMaruyamaPredictor):
+    return predictor_obj.update_fn(x, t, dt=dt)
   return predictor_obj.update_fn(x, t)
 
 
@@ -390,8 +395,8 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
 
   def get_time_grid():
     if isinstance(sde, sde_lib.FoxVPSDE):
-      return sde.sampling_time_grid(eps, grid=time_grid, device=device, dtype=torch.float32)
-    return torch.linspace(sde.T, eps, sde.N, device=device)
+      return sde.sampling_time_grid(eps, grid=time_grid, device=device, dtype=torch.float32, N=sde.N + 1)
+    return torch.linspace(sde.T, eps, sde.N + 1, device=device)
 
   def pc_sampler(model):
     """ The PC sampler funciton.
@@ -408,9 +413,11 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
 
       for i in range(sde.N):
         t = timesteps[i]
+        next_t = timesteps[i + 1]
+        dt = next_t - t
         vec_t = torch.ones(shape[0], device=t.device) * t
         x, x_mean = corrector_update_fn(x, vec_t, model=model)
-        x, x_mean = predictor_update_fn(x, vec_t, model=model)
+        x, x_mean = predictor_update_fn(x, vec_t, model=model, dt=dt)
 
       return inverse_scaler(x_mean if denoise else x), sde.N * (n_steps + 1)
 
