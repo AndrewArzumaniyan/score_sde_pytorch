@@ -25,6 +25,7 @@ def get_default_configs():
   sampling.noise_removal = True
   sampling.probability_flow = False
   sampling.snr = 0.17
+  sampling.time_grid = 'uniform_time'
 
   # evaluation
   config.eval = evaluate = ml_collections.ConfigDict()
@@ -36,6 +37,7 @@ def get_default_configs():
   evaluate.enable_loss = True
   evaluate.enable_bpd = False
   evaluate.bpd_dataset = 'test'
+  evaluate.sampling_num_scales = 0
 
   # data
   config.data = data = ml_collections.ConfigDict()
