@@ -143,8 +143,8 @@ def resize_small(image, resolution):
   """Shrink an image to the given resolution."""
   h, w = image.shape[0], image.shape[1]
   ratio = resolution / min(h, w)
-  h = tf.round(h * ratio, tf.int32)
-  w = tf.round(w * ratio, tf.int32)
+  h = tf.cast(tf.round(h * ratio), tf.int32)
+  w = tf.cast(tf.round(w * ratio), tf.int32)
   return tf.image.resize(image, [h, w], antialias=True)
 
 
