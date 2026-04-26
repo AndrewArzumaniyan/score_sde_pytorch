@@ -103,16 +103,32 @@ def _preprocess_celeba_image(image, resolution):
   return image * 255.
 
 
-def _compute_celeba_stats(filename, inception_model, batch_size, resolution):
-  """Compute and persist CelebA pool_3 statistics from the TFDS train split."""
-  tfds_data_dir = os.environ.get('TFDS_DATA_DIR')
-  ds = tfds.load(
-    'celeb_a',
-    split='train',
-    data_dir=tfds_data_dir,
-    shuffle_files=False)
-  ds = ds.map(lambda example: _preprocess_celeba_image(example['image'], resolution),
-              num_parallel_calls=tf.data.experimental.AUTOTUNE)
+def _load_local_celeba_image(path, resolution):
+  image = tf.io.read_file(path)
+  image = tf.image.decode_jpeg(image, channels=3)
+  image.set_shape([218, 178, 3])
+  return _preprocess_celeba_image(image, resolution)
+
+
+def _compute_celeba_stats(filename, inception_model, batch_size, config):
+  """Compute and persist CelebA pool_3 statistics from local data or TFDS."""
+  resolution = config.data.image_size
+  local_paths = datasets_lib.get_local_celeba_split_paths('train', config)
+  if local_paths is not None:
+    logging.info('Computing CelebA stats from local directory: %s',
+                 datasets_lib.get_local_celeba_root(config))
+    ds = tf.data.Dataset.from_tensor_slices(local_paths)
+    ds = ds.map(lambda path: _load_local_celeba_image(path, resolution),
+                num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  else:
+    tfds_data_dir = os.environ.get('TFDS_DATA_DIR')
+    ds = tfds.load(
+      'celeb_a',
+      split='train',
+      data_dir=tfds_data_dir,
+      shuffle_files=False)
+    ds = ds.map(lambda example: _preprocess_celeba_image(example['image'], resolution),
+                num_parallel_calls=tf.data.experimental.AUTOTUNE)
   ds = ds.batch(batch_size)
   ds = ds.prefetch(tf.data.experimental.AUTOTUNE)
 
@@ -145,7 +161,7 @@ def load_dataset_stats(config, inception_model=None):
     if config.data.dataset == 'CIFAR10':
       _compute_cifar10_stats(filename, inception_model, batch_size)
     elif config.data.dataset == 'CELEBA':
-      _compute_celeba_stats(filename, inception_model, batch_size, config.data.image_size)
+      _compute_celeba_stats(filename, inception_model, batch_size, config)
     else:
       raise FileNotFoundError(
         f'Dataset stats file {filename} does not exist. '

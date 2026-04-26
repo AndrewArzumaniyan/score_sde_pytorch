@@ -25,3 +25,8 @@ __pycache__
 
 tmp*
 tests*
+
+*run*
+*eval*
+*.npz
+workdirs/*

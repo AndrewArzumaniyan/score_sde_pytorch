@@ -42,6 +42,7 @@ def get_default_configs():
   # data
   config.data = data = ml_collections.ConfigDict()
   data.dataset = 'CELEBA'
+  data.celeba_dir = 'celeba'
   data.image_size = 64
   data.random_flip = True
   data.uniform_dequantization = False

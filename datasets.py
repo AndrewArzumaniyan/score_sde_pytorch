@@ -26,6 +26,87 @@ except ImportError:
   jax = None
 
 
+_CELEBA_PARTITIONS = {
+  'train': '0',
+  'validation': '1',
+  'test': '2',
+}
+
+
+def _normalize_local_celeba_root(path):
+  """Return the CelebA root containing metadata files and img_align_celeba."""
+  if not path:
+    return None
+
+  candidates = [path, os.path.join(path, 'celeba')]
+  required_files = (
+    'list_eval_partition.txt',
+    'list_attr_celeba.txt',
+    'list_landmarks_align_celeba.txt',
+  )
+  for candidate in candidates:
+    if not os.path.isdir(candidate):
+      continue
+    image_dir = os.path.join(candidate, 'img_align_celeba')
+    if not os.path.isdir(image_dir):
+      continue
+    if all(os.path.isfile(os.path.join(candidate, name)) for name in required_files):
+      return candidate
+  return None
+
+
+def get_local_celeba_root(config=None):
+  """Locate a locally prepared CelebA directory if present."""
+  candidates = []
+  if config is not None:
+    celeba_dir = getattr(getattr(config, 'data', None), 'celeba_dir', None)
+    if celeba_dir:
+      candidates.append(celeba_dir)
+
+  env_dir = os.environ.get('CELEBA_DIR')
+  if env_dir:
+    candidates.append(env_dir)
+
+  repo_root = os.path.dirname(os.path.abspath(__file__))
+  cwd = os.getcwd()
+  candidates.extend([
+    os.path.join(cwd, 'celeba'),
+    os.path.join(repo_root, 'celeba'),
+  ])
+
+  seen = set()
+  for candidate in candidates:
+    normalized = _normalize_local_celeba_root(candidate)
+    if normalized and normalized not in seen:
+      return normalized
+    if normalized:
+      seen.add(normalized)
+  return None
+
+
+def get_local_celeba_split_paths(split, config=None):
+  """Return absolute image paths for a local CelebA split, or None if absent."""
+  celeba_root = get_local_celeba_root(config)
+  if celeba_root is None:
+    return None
+  if split not in _CELEBA_PARTITIONS:
+    raise ValueError(f'Unknown CelebA split: {split}')
+
+  image_dir = os.path.join(celeba_root, 'img_align_celeba')
+  partition_file = os.path.join(celeba_root, 'list_eval_partition.txt')
+  partition_id = _CELEBA_PARTITIONS[split]
+  image_paths = []
+  with open(partition_file, 'r') as fin:
+    for line in fin:
+      line = line.strip()
+      if not line:
+        continue
+      filename, partition = line.split()
+      if partition == partition_id:
+        image_paths.append(os.path.join(image_dir, filename))
+  return image_paths
+
+
 def get_data_scaler(config):
   """Data normalizer. Assume data are always in [0, 1]."""
   if config.data.centered:
@@ -118,7 +199,8 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
       return tf.image.resize(img, [config.data.image_size, config.data.image_size], antialias=True)
 
   elif config.data.dataset == 'CELEBA':
-    dataset_builder = tfds.builder('celeb_a', data_dir=tfds_data_dir)
+    local_celeba_root = get_local_celeba_root(config)
+    dataset_builder = local_celeba_root or tfds.builder('celeb_a', data_dir=tfds_data_dir)
     train_split_name = 'train'
     eval_split_name = 'validation'
 
@@ -187,7 +269,21 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
     dataset_options.experimental_threading.private_threadpool_size = 48
     dataset_options.experimental_threading.max_intra_op_parallelism = 1
     read_config = tfds.ReadConfig(options=dataset_options)
-    if isinstance(dataset_builder, tfds.core.DatasetBuilder):
+    if config.data.dataset == 'CELEBA' and isinstance(dataset_builder, str):
+      image_paths = get_local_celeba_split_paths(split, config)
+      if image_paths is None:
+        raise FileNotFoundError('Local CelebA directory was expected but not found.')
+      ds = tf.data.Dataset.from_tensor_slices(image_paths)
+
+      def load_local_celeba_example(path):
+        image = tf.io.read_file(path)
+        image = tf.image.decode_jpeg(image, channels=3)
+        image.set_shape([218, 178, 3])
+        return dict(image=image, label=None)
+
+      ds = ds.with_options(dataset_options)
+      ds = ds.map(load_local_celeba_example, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    elif isinstance(dataset_builder, tfds.core.DatasetBuilder):
       dataset_builder.download_and_prepare()
       ds = dataset_builder.as_dataset(
         split=split, shuffle_files=True, read_config=read_config)
