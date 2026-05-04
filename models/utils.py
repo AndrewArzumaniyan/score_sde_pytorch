@@ -57,7 +57,7 @@ def get_sigmas(config):
   sigmas = np.exp(
     np.linspace(np.log(config.model.sigma_max), np.log(config.model.sigma_min), config.model.num_scales))
 
-  return sigmas
+  return sigmas.astype(np.float32)
 
 
 def get_ddpm_params(config):

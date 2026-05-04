@@ -439,7 +439,8 @@ class VESDE(SDE):
     super().__init__(N)
     self.sigma_min = sigma_min
     self.sigma_max = sigma_max
-    self.discrete_sigmas = torch.exp(torch.linspace(np.log(self.sigma_min), np.log(self.sigma_max), N))
+    self.discrete_sigmas = torch.exp(
+      torch.linspace(np.log(self.sigma_min), np.log(self.sigma_max), N, dtype=torch.float32))
     self.N = N
 
   @property
@@ -449,8 +450,10 @@ class VESDE(SDE):
   def sde(self, x, t):
     sigma = self.sigma_min * (self.sigma_max / self.sigma_min) ** t
     drift = torch.zeros_like(x)
-    diffusion = sigma * torch.sqrt(torch.tensor(2 * (np.log(self.sigma_max) - np.log(self.sigma_min)),
-                                                device=t.device))
+    diffusion = sigma * torch.sqrt(torch.tensor(
+      2 * (np.log(self.sigma_max) - np.log(self.sigma_min)),
+      device=t.device,
+      dtype=t.dtype))
     return drift, diffusion
 
   def marginal_prob(self, x, t):
@@ -469,10 +472,10 @@ class VESDE(SDE):
   def discretize(self, x, t):
     """SMLD(NCSN) discretization."""
     timestep = (t * (self.N - 1) / self.T).long()
-    discrete_sigmas = self.discrete_sigmas.to(t.device)
+    discrete_sigmas = self.discrete_sigmas.to(device=t.device, dtype=t.dtype)
     sigma = discrete_sigmas[timestep]
     adjacent_sigma = torch.where(timestep == 0, torch.zeros_like(t),
                                  discrete_sigmas[timestep - 1])
     f = torch.zeros_like(x)
-    G = torch.sqrt(sigma ** 2 - adjacent_sigma ** 2)
+    G = torch.sqrt(torch.clamp(sigma ** 2 - adjacent_sigma ** 2, min=0.0))
     return f, G

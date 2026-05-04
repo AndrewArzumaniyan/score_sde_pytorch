@@ -268,19 +268,19 @@ class LangevinCorrector(Corrector):
     sde = self.sde
     score_fn = self.score_fn
     n_steps = self.n_steps
-    target_snr = self.snr
+    target_snr = torch.as_tensor(self.snr, device=x.device, dtype=x.dtype)
     if isinstance(sde, sde_lib.VPSDE) or isinstance(sde, sde_lib.subVPSDE):
       timestep = (t * (sde.N - 1) / sde.T).long()
-      alpha = sde.alphas.to(t.device)[timestep]
+      alpha = sde.alphas.to(device=x.device, dtype=x.dtype)[timestep]
     else:
-      alpha = torch.ones_like(t)
+      alpha = torch.ones_like(t, device=x.device, dtype=x.dtype)
 
     for i in range(n_steps):
       grad = score_fn(x, t)
       noise = torch.randn_like(x)
       grad_norm = torch.norm(grad.reshape(grad.shape[0], -1), dim=-1).mean()
       noise_norm = torch.norm(noise.reshape(noise.shape[0], -1), dim=-1).mean()
-      step_size = (target_snr * noise_norm / grad_norm) ** 2 * 2 * alpha
+      step_size = ((target_snr * noise_norm / grad_norm) ** 2 * 2 * alpha).to(x.dtype)
       x_mean = x + step_size[:, None, None, None] * grad
       x = x_mean + torch.sqrt(step_size * 2)[:, None, None, None] * noise
 
@@ -305,19 +305,19 @@ class AnnealedLangevinDynamics(Corrector):
     sde = self.sde
     score_fn = self.score_fn
     n_steps = self.n_steps
-    target_snr = self.snr
+    target_snr = torch.as_tensor(self.snr, device=x.device, dtype=x.dtype)
     if isinstance(sde, sde_lib.VPSDE) or isinstance(sde, sde_lib.subVPSDE):
       timestep = (t * (sde.N - 1) / sde.T).long()
-      alpha = sde.alphas.to(t.device)[timestep]
+      alpha = sde.alphas.to(device=x.device, dtype=x.dtype)[timestep]
     else:
-      alpha = torch.ones_like(t)
+      alpha = torch.ones_like(t, device=x.device, dtype=x.dtype)
 
-    std = self.sde.marginal_prob(x, t)[1]
+    std = self.sde.marginal_prob(x, t)[1].to(device=x.device, dtype=x.dtype)
 
     for i in range(n_steps):
       grad = score_fn(x, t)
       noise = torch.randn_like(x)
-      step_size = (target_snr * std) ** 2 * 2 * alpha
+      step_size = ((target_snr * std) ** 2 * 2 * alpha).to(x.dtype)
       x_mean = x + step_size[:, None, None, None] * grad
       x = x_mean + noise * torch.sqrt(step_size * 2)[:, None, None, None]
 
@@ -397,7 +397,7 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
   def get_time_grid():
     if isinstance(sde, sde_lib.FoxVPSDE):
       return sde.sampling_time_grid(eps, grid=time_grid, device=device, dtype=torch.float32, N=sde.N + 1)
-    return torch.linspace(sde.T, eps, sde.N + 1, device=device)
+    return torch.linspace(sde.T, eps, sde.N + 1, device=device, dtype=torch.float32)
 
   def pc_sampler(model):
     """ The PC sampler funciton.
