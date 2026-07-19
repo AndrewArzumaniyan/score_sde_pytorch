@@ -289,6 +289,11 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
         split=split, shuffle_files=True, read_config=read_config)
     else:
       ds = dataset_builder.with_options(dataset_options)
+    cifar10_class = getattr(config.data, 'cifar10_class', -1)
+    if config.data.dataset == 'CIFAR10' and cifar10_class >= 0:
+      if cifar10_class > 9:
+        raise ValueError(f'CIFAR-10 class must be in [0, 9], got {cifar10_class}.')
+      ds = ds.filter(lambda example: tf.equal(example['label'], cifar10_class))
     ds = ds.repeat(count=num_epochs)
     ds = ds.shuffle(shuffle_buffer_size)
     ds = ds.map(preprocess_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)

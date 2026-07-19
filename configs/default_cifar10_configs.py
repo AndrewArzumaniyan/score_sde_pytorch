@@ -47,6 +47,11 @@ def get_default_configs():
   data.centered = False
   data.uniform_dequantization = False
   data.num_channels = 3
+  # Use -1 for the full dataset, or a CIFAR-10 label in [0, 9] for a
+  # single-class experiment. Statistics default to the train split to retain
+  # the original CIFAR-10 FID protocol.
+  data.cifar10_class = -1
+  data.cifar10_stats_split = 'train'
 
   # model
   config.model = model = ml_collections.ConfigDict()
