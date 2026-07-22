@@ -55,14 +55,19 @@ def _get_stats_filename(config):
   """Return the dataset statistics path for the configured dataset."""
   if config.data.dataset == 'CIFAR10':
     cifar10_class = getattr(config.data, 'cifar10_class', -1)
+    stats_split = getattr(config.data, 'cifar10_stats_split', 'train')
+    if stats_split not in ('train', 'test'):
+      raise ValueError(
+        f'CIFAR-10 statistics split must be train or test, got {stats_split}.')
+    per_class = getattr(config.data, f'cifar10_{stats_split}_per_class', -1)
+    if cifar10_class >= 0 and per_class >= 0:
+      raise ValueError('Set either cifar10_class or a balanced per-class subset, not both.')
     if cifar10_class >= 0:
-      stats_split = getattr(config.data, 'cifar10_stats_split', 'train')
       if cifar10_class > 9:
         raise ValueError(f'CIFAR-10 class must be in [0, 9], got {cifar10_class}.')
-      if stats_split not in ('train', 'test'):
-        raise ValueError(
-          f'CIFAR-10 statistics split must be train or test, got {stats_split}.')
       return f'assets/stats/cifar10_class_{cifar10_class}_{stats_split}_stats.npz'
+    if per_class >= 0:
+      return f'assets/stats/cifar10_balanced_{per_class}_per_class_{stats_split}_stats.npz'
     return 'assets/stats/cifar10_stats.npz'
   elif config.data.dataset == 'CELEBA':
     return 'assets/stats/celeba_stats.npz'
@@ -72,8 +77,8 @@ def _get_stats_filename(config):
     raise ValueError(f'Dataset {config.data.dataset} stats not found.')
 
 
-def _compute_cifar10_stats(filename, inception_model, batch_size,
-                           cifar10_class=-1, split='train'):
+def _compute_cifar10_stats(filename, inception_model, batch_size, config,
+                           split='train'):
   """Compute and persist CIFAR-10 pool_3 statistics from a TFDS split."""
   tfds_data_dir = os.environ.get('TFDS_DATA_DIR')
   ds = tfds.load(
@@ -81,8 +86,7 @@ def _compute_cifar10_stats(filename, inception_model, batch_size,
     split=split,
     data_dir=tfds_data_dir,
     shuffle_files=False)
-  if cifar10_class >= 0:
-    ds = ds.filter(lambda example: tf.equal(example['label'], cifar10_class))
+  ds = datasets_lib.select_cifar10_subset(ds, config, split)
   ds = ds.map(lambda example: example['image'],
               num_parallel_calls=tf.data.experimental.AUTOTUNE)
   ds = ds.batch(batch_size)
@@ -175,7 +179,7 @@ def load_dataset_stats(config, inception_model=None):
         filename,
         inception_model,
         batch_size,
-        cifar10_class=getattr(config.data, 'cifar10_class', -1),
+        config=config,
         split=getattr(config.data, 'cifar10_stats_split', 'train'))
     elif config.data.dataset == 'CELEBA':
       _compute_celeba_stats(filename, inception_model, batch_size, config)

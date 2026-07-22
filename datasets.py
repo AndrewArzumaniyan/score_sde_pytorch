@@ -155,6 +155,34 @@ def central_crop(image, size):
   return tf.image.crop_to_bounding_box(image, top, left, size, size)
 
 
+def select_cifar10_subset(ds, config, split):
+  """Select a configured CIFAR-10 class or deterministic balanced subset."""
+  cifar10_class = getattr(config.data, 'cifar10_class', -1)
+  per_class_name = f'cifar10_{split}_per_class'
+  per_class = getattr(config.data, per_class_name, -1)
+  if split not in ('train', 'test'):
+    raise ValueError(f'Unknown CIFAR-10 split: {split}')
+  if cifar10_class >= 0 and per_class >= 0:
+    raise ValueError('Set either cifar10_class or a balanced per-class subset, not both.')
+  if cifar10_class >= 0:
+    if cifar10_class > 9:
+      raise ValueError(f'CIFAR-10 class must be in [0, 9], got {cifar10_class}.')
+    return ds.filter(lambda example: tf.equal(example['label'], cifar10_class))
+  if per_class < 0:
+    return ds
+
+  class_datasets = []
+  for class_id in range(10):
+    class_ds = ds.filter(
+      lambda example, class_id=class_id: tf.equal(example['label'], class_id))
+    class_datasets.append(class_ds.take(per_class))
+  return class_datasets[0].concatenate(class_datasets[1]).concatenate(
+    class_datasets[2]).concatenate(class_datasets[3]).concatenate(
+      class_datasets[4]).concatenate(class_datasets[5]).concatenate(
+        class_datasets[6]).concatenate(class_datasets[7]).concatenate(
+          class_datasets[8]).concatenate(class_datasets[9])
+
+
 def get_dataset(config, uniform_dequantization=False, evaluation=False):
   """Create data loaders for training and evaluation.
 
@@ -289,11 +317,8 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
         split=split, shuffle_files=True, read_config=read_config)
     else:
       ds = dataset_builder.with_options(dataset_options)
-    cifar10_class = getattr(config.data, 'cifar10_class', -1)
-    if config.data.dataset == 'CIFAR10' and cifar10_class >= 0:
-      if cifar10_class > 9:
-        raise ValueError(f'CIFAR-10 class must be in [0, 9], got {cifar10_class}.')
-      ds = ds.filter(lambda example: tf.equal(example['label'], cifar10_class))
+    if config.data.dataset == 'CIFAR10':
+      ds = select_cifar10_subset(ds, config, split)
     ds = ds.repeat(count=num_epochs)
     ds = ds.shuffle(shuffle_buffer_size)
     ds = ds.map(preprocess_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)

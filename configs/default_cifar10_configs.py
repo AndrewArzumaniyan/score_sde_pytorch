@@ -52,6 +52,10 @@ def get_default_configs():
   # the original CIFAR-10 FID protocol.
   data.cifar10_class = -1
   data.cifar10_stats_split = 'train'
+  # Optional balanced CIFAR-10 subset. When set, retain this many examples
+  # from each of the ten classes in the corresponding split.
+  data.cifar10_train_per_class = -1
+  data.cifar10_test_per_class = -1
 
   # model
   config.model = model = ml_collections.ConfigDict()
