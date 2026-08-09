@@ -207,11 +207,16 @@ class subVPSDE(SDE):
 class FoxVPSDE(SDE):
   """Variance-preserving-style SDE induced by the exact Fox reduction.
 
-  The forward process uses a constant linear drift and a time-dependent
-  effective diffusion coefficient obtained from the chosen colored-noise
-  kernel:
+  The forward process uses a deterministic linear drift ``k(t) x`` and a
+  time-dependent effective diffusion coefficient obtained from the chosen
+  colored-noise kernel:
 
-    dx = u x dt + sqrt(2 D_eff(t)) dW_t
+    dx = k(t) x dt + sqrt(2 D_eff(t)) dW_t
+
+  For ``drift_schedule='vp_linear'``, ``k(t)=-beta(t)/2`` with the same
+  linear beta schedule as ``VPSDE``.  This is an exact one-time-marginal
+  reduction: D_eff(t) uses the response exp(integral_s^t k(r) dr), rather
+  than the constant-drift response exp(u (t-s)).
 
   Marginals remain Gaussian, so the rest of the score-matching pipeline can
   reuse the standard continuous-time VP path.
@@ -219,6 +224,9 @@ class FoxVPSDE(SDE):
 
   def __init__(self,
                u=-0.5,
+               drift_schedule='constant',
+               beta_min=0.1,
+               beta_max=20.0,
                diffusion_scale=1.0,
                kernel='gaussian',
                gaussian_sigma=0.35,
@@ -233,6 +241,9 @@ class FoxVPSDE(SDE):
       raise ValueError('schedule_grid_size must be at least 2.')
 
     self.u = float(u)
+    self.drift_schedule = self._normalize_drift_schedule_name(drift_schedule)
+    self.beta_min = float(beta_min)
+    self.beta_max = float(beta_max)
     self.diffusion_scale = float(diffusion_scale)
     self.kernel = self._normalize_kernel_name(kernel)
     self.gaussian_sigma = float(gaussian_sigma)
@@ -258,6 +269,12 @@ class FoxVPSDE(SDE):
       return 'matern_3_2'
     return normalized
 
+  def _normalize_drift_schedule_name(self, schedule):
+    normalized = schedule.lower()
+    if normalized in ('vp', 'vp-linear', 'vp_linear_beta'):
+      return 'vp_linear'
+    return normalized
+
   def _validate_params(self):
     if self.diffusion_scale <= 0.0:
       raise ValueError('diffusion_scale must be positive.')
@@ -273,6 +290,16 @@ class FoxVPSDE(SDE):
       raise ValueError('matern_length_scale must be positive.')
     if self.target_terminal_variance is not None and self.target_terminal_variance <= 0.0:
       raise ValueError('target_terminal_variance must be positive.')
+    if self.drift_schedule not in ('constant', 'vp_linear'):
+      raise ValueError('Unsupported Fox drift schedule: %s' % self.drift_schedule)
+    if self.beta_min <= 0.0 or self.beta_max <= 0.0:
+      raise ValueError('Fox VP beta_min and beta_max must be positive.')
+
+  def _drift_coefficient_np(self, t):
+    if self.drift_schedule == 'constant':
+      return np.full_like(t, self.u, dtype=np.float64)
+    beta_t = self.beta_min + t * (self.beta_max - self.beta_min)
+    return -0.5 * beta_t
 
   def _kernel_correlation_np(self, tau):
     if self.kernel == 'gaussian':
@@ -297,12 +324,29 @@ class FoxVPSDE(SDE):
 
   def _build_schedule_cache(self):
     times = np.linspace(0.0, self.T, self.schedule_grid_size, dtype=np.float64)
-    kernel_correlation = self._kernel_correlation_np(times)
-    effective_diffusion_integrand = kernel_correlation * np.exp(self.u * times)
-    effective_diffusion = self._cumulative_trapezoid_np(times, effective_diffusion_integrand)
+    drift_coefficient = self._drift_coefficient_np(times)
+    log_mean_coeff = self._cumulative_trapezoid_np(times, drift_coefficient)
 
-    variance_integrand = effective_diffusion * np.exp(-2.0 * self.u * times)
-    variance = 2.0 * np.exp(2.0 * self.u * times) * self._cumulative_trapezoid_np(times, variance_integrand)
+    if self.drift_schedule == 'constant':
+      # Preserve the previous, one-dimensional quadrature path exactly.
+      kernel_correlation = self._kernel_correlation_np(times)
+      effective_diffusion_integrand = kernel_correlation * np.exp(self.u * times)
+      effective_diffusion = self._cumulative_trapezoid_np(times, effective_diffusion_integrand)
+    else:
+      # D_eff(t_i) = int_0^t_i C(t_i-s) exp(K(t_i)-K(s)) ds, K'=k.
+      # The kernels implemented here are stationary, so this is an exact
+      # deterministic response factor evaluated by trapezoidal quadrature.
+      effective_diffusion = np.zeros_like(times)
+      for index in range(1, times.size):
+        past_times = times[:index + 1]
+        lag = times[index] - past_times
+        response = np.exp(log_mean_coeff[index] - log_mean_coeff[:index + 1])
+        integrand = self._kernel_correlation_np(lag) * response
+        effective_diffusion[index] = np.sum(
+          0.5 * (integrand[1:] + integrand[:-1]) * np.diff(past_times))
+
+    variance_integrand = effective_diffusion * np.exp(-2.0 * log_mean_coeff)
+    variance = 2.0 * np.exp(2.0 * log_mean_coeff) * self._cumulative_trapezoid_np(times, variance_integrand)
 
     if self.target_terminal_variance is not None:
       terminal_variance = variance[-1]
@@ -317,6 +361,8 @@ class FoxVPSDE(SDE):
     effective_diffusion = np.maximum(effective_diffusion, 0.0)
 
     self._schedule_times_cpu = torch.from_numpy(times)
+    self._drift_coefficient_cpu = torch.from_numpy(drift_coefficient)
+    self._log_mean_coeff_cpu = torch.from_numpy(log_mean_coeff)
     self._effective_diffusion_cpu = torch.from_numpy(effective_diffusion)
     self._variance_cpu = torch.from_numpy(variance)
     # Expose the cached variance under an explicit name for sanity checks/debugging.
@@ -335,6 +381,8 @@ class FoxVPSDE(SDE):
     if cached is None:
       cached = (
         self._schedule_times_cpu.to(device=t.device, dtype=t.dtype),
+        self._drift_coefficient_cpu.to(device=t.device, dtype=t.dtype),
+        self._log_mean_coeff_cpu.to(device=t.device, dtype=t.dtype),
         self._effective_diffusion_cpu.to(device=t.device, dtype=t.dtype),
         self._variance_cpu.to(device=t.device, dtype=t.dtype),
       )
@@ -342,7 +390,7 @@ class FoxVPSDE(SDE):
     return cached
 
   def _interpolate(self, t, values):
-    schedule_times, _, _ = self._cached_schedule(t)
+    schedule_times = self._cached_schedule(t)[0]
     t = torch.clamp(t, 0.0, self.T)
     indices = torch.searchsorted(schedule_times, t)
     indices = torch.clamp(indices, 1, schedule_times.shape[0] - 1)
@@ -357,14 +405,19 @@ class FoxVPSDE(SDE):
     return v0 + weight * (v1 - v0)
 
   def mean_coeff(self, t):
-    return torch.exp(self.u * t)
+    _, _, log_mean_coeff, _, _ = self._cached_schedule(t)
+    return torch.exp(self._interpolate(t, log_mean_coeff))
+
+  def drift_coefficient(self, t):
+    _, drift_coefficient, _, _, _ = self._cached_schedule(t)
+    return self._interpolate(t, drift_coefficient)
 
   def effective_diffusion(self, t):
-    _, effective_diffusion, _ = self._cached_schedule(t)
+    _, _, _, effective_diffusion, _ = self._cached_schedule(t)
     return self._interpolate(t, effective_diffusion)
 
   def marginal_variance(self, t):
-    _, _, variance = self._cached_schedule(t)
+    _, _, _, _, variance = self._cached_schedule(t)
     return torch.clamp(self._interpolate(t, variance), min=0.0)
 
   def sampling_time_grid(self, eps, grid='uniform_time', device=None, dtype=None, N=None):
@@ -405,7 +458,7 @@ class FoxVPSDE(SDE):
     return timesteps
 
   def sde(self, x, t):
-    drift = self.u * x
+    drift = self.drift_coefficient(t)[:, None, None, None] * x
     diffusion = torch.sqrt(torch.clamp(2.0 * self.effective_diffusion(t), min=0.0))
     return drift, diffusion
 

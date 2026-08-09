@@ -63,6 +63,11 @@ def get_config():
   model.conv_size = 3
 
   model.fox_u = -5.0
+  # Set to 'vp_linear' to use k(t) = -beta(t)/2 instead of the constant u.
+  # Keeping this default preserves compatibility with existing FOX checkpoints.
+  model.fox_drift_schedule = 'constant'
+  model.fox_beta_min = model.beta_min
+  model.fox_beta_max = model.beta_max
   model.fox_diffusion_scale = 1.0
   model.fox_kernel = 'gaussian'
   model.fox_gaussian_sigma = 0.2
@@ -73,4 +78,3 @@ def get_config():
   model.fox_target_terminal_variance = 1.0
 
   return config
-

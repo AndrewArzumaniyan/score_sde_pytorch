@@ -76,6 +76,9 @@ def get_sde(config, n_override=None):
   if sde_name == 'foxvpsde':
     return sde_lib.FoxVPSDE(
       u=config.model.fox_u,
+      drift_schedule=getattr(config.model, 'fox_drift_schedule', 'constant'),
+      beta_min=getattr(config.model, 'fox_beta_min', config.model.beta_min),
+      beta_max=getattr(config.model, 'fox_beta_max', config.model.beta_max),
       diffusion_scale=config.model.fox_diffusion_scale,
       kernel=config.model.fox_kernel,
       gaussian_sigma=config.model.fox_gaussian_sigma,
