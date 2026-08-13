@@ -25,6 +25,7 @@ import abc
 from models.utils import from_flattened_numpy, to_flattened_numpy, get_score_fn
 from scipy import integrate
 import sde_lib
+import edm_lib
 from models import utils as mutils
 
 _CORRECTORS = {}
@@ -93,6 +94,10 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
   """
 
   sampler_name = config.sampling.method
+  if sampler_name.lower() == 'edm':
+    if not isinstance(sde, edm_lib.EDM):
+      raise ValueError('The EDM sampler requires an EDM configuration object.')
+    return get_edm_sampler(sde, shape, inverse_scaler, device=device_from_config(config))
   # Probability flow ODE sampling with black-box ODE solvers
   if sampler_name.lower() == 'ode':
     sampling_fn = get_ode_sampler(sde=sde,
@@ -122,6 +127,47 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
     raise ValueError(f"Sampler name {sampler_name} unknown.")
 
   return sampling_fn
+
+
+def device_from_config(config):
+  """Keep sampler device handling uniform across score-SDE and EDM paths."""
+  return config.device
+
+
+def get_edm_sampler(edm, shape, inverse_scaler, device='cuda'):
+  """EDM Algorithm 2: Karras grid, optional churn, Euler + Heun correction."""
+
+  def edm_sampler(model):
+    with torch.no_grad():
+      t_steps = edm.noise_levels(device=device, dtype=torch.float64)
+      x_next = torch.randn(*shape, device=device, dtype=torch.float64) * t_steps[0]
+      nfe = 0
+
+      for index, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
+        x_cur = x_next
+        gamma = edm.churn_gamma(t_cur)
+        t_hat = t_cur * (1.0 + gamma)
+        noise_scale = torch.sqrt(torch.clamp(t_hat ** 2 - t_cur ** 2, min=0.0))
+        x_hat = x_cur + noise_scale * edm.s_noise * torch.randn_like(x_cur)
+
+        sigma_hat = torch.full(
+          (shape[0],), float(t_hat), device=device, dtype=torch.float32)
+        denoised = model(x_hat.to(torch.float32), sigma_hat).to(torch.float64)
+        nfe += 1
+        d_cur = (x_hat - denoised) / t_hat
+        x_next = x_hat + (t_next - t_hat) * d_cur
+
+        if index < edm.N - 1:
+          sigma_next = torch.full(
+            (shape[0],), float(t_next), device=device, dtype=torch.float32)
+          denoised_next = model(x_next.to(torch.float32), sigma_next).to(torch.float64)
+          nfe += 1
+          d_prime = (x_next - denoised_next) / t_next
+          x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+
+      return inverse_scaler(x_next.to(torch.float32)), nfe
+
+  return edm_sampler
 
 
 class Predictor(abc.ABC):

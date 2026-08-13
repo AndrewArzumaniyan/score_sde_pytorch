@@ -29,7 +29,7 @@ class ExponentialMovingAverage:
                           for p in parameters if p.requires_grad]
     self.collected_params = []
 
-  def update(self, parameters):
+  def update(self, parameters, decay=None):
     """
     Update currently maintained parameters.
 
@@ -40,8 +40,11 @@ class ExponentialMovingAverage:
       parameters: Iterable of `torch.nn.Parameter`; usually the same set of
         parameters used to initialize this object.
     """
-    decay = self.decay
-    if self.num_updates is not None:
+    use_scheduled_decay = decay is not None
+    decay = self.decay if decay is None else decay
+    if decay < 0.0 or decay > 1.0:
+      raise ValueError('Decay must be between 0 and 1')
+    if self.num_updates is not None and not use_scheduled_decay:
       self.num_updates += 1
       decay = min(decay, (1 + self.num_updates) / (10 + self.num_updates))
     one_minus_decay = 1.0 - decay

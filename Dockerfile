@@ -47,7 +47,9 @@ COPY . /workspace/score_sde_pytorch
 
 RUN mkdir -p "$TFDS_DATA_DIR" "$TORCH_EXTENSIONS_DIR" "$XDG_CACHE_HOME"
 
-RUN python -m py_compile main.py run_lib.py sde_lib.py \
+RUN python -m py_compile main.py run_lib.py sde_lib.py edm_lib.py \
+    models/edm.py models/edm_canonical.py \
+    && python baseline_validation.py \
     && if [ -f tests/test_fox_sde.py ]; then python -m unittest tests.test_fox_sde; fi
 
 CMD ["/bin/bash"]

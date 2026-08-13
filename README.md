@@ -27,6 +27,82 @@ In this fork we:
 - added an exact Fox-reduced `FoxVPSDE` with constant linear drift and colored-noise kernels: Gaussian, Power-law, Mat\'ern $1/2$, and Mat\'ern $3/2$;
 - integrated the new SDE into the continuous training and sampling pipeline with dedicated CIFAR-10 configs;
 - added practical runtime compatibility fixes used in experiments, including fallbacks for custom CUDA ops and mixed TensorFlow/PyTorch startup issues.
+- added controlled Cosine-VP baselines using the schedule from Improved DDPM;
+- added an EDM-preconditioned NCSN++ baseline with the EDM loss, log-normal
+  noise-level distribution, Karras grid, and Algorithm 2 Heun sampler.
+
+### Cosine-VP and EDM baselines
+
+The new baselines reuse the repository's training loop, logging, checkpoints,
+snapshot samples, and IS/FID/KID evaluation artifacts.  Train them exactly like
+the existing VP/VE/FOX configurations:
+
+```sh
+python main.py --mode=train \
+  --config=configs/vp/cifar10_ncsnpp_cosine_continuous.py \
+  --workdir=workdirs/cifar10_cosine_vp
+
+python main.py --mode=train \
+  --config=configs/edm/cifar10_ncsnpp.py \
+  --workdir=workdirs/cifar10_edm
+```
+
+Two EDM variants are available:
+
+- `configs/edm/*_ncsnpp.py` is the controlled EDM-preconditioned version of
+  this repository's NCSN++;
+- `configs/edm/*_canonical.py` uses the unmodified official NVLabs
+  `EDMPrecond`, DDPM++-preset `SongUNet`, and `AugmentPipe`.
+
+Install the separately licensed official implementation at the pinned commit
+before using the canonical configs:
+
+```sh
+tools/install_official_edm.sh
+
+python main.py --mode=train \
+  --config=configs/edm/cifar10_canonical.py \
+  --workdir=workdirs/cifar10_edm_canonical
+
+python main.py --mode=train \
+  --config=configs/edm/celeba_canonical.py \
+  --workdir=workdirs/celeba_edm_canonical
+
+python main.py --mode=eval \
+  --config=configs/edm/cifar10_canonical.py \
+  --workdir=workdirs/cifar10_edm_canonical --eval_folder=eval
+```
+
+The canonical recipe uses an effective batch of 512 as four microbatches of
+128, a 200M-image training budget, official 10M-image LR warmup, 500k-image
+EMA half-life, and augmentation probability 0.12. The CelebA config transfers
+the official EDM recipe to 64x64 CelebA; it is not a reproduction of a
+published CelebA number from the EDM paper.
+
+CelebA uses the matching configs
+`configs/vp/celeba_ncsnpp_cosine_continuous.py` and
+`configs/edm/celeba_ncsnpp.py`. Evaluation uses the same command and directory
+layout as every other model:
+
+```sh
+python main.py --mode=eval --config=configs/edm/cifar10_ncsnpp.py \
+  --workdir=workdirs/cifar10_edm --eval_folder=eval
+```
+
+Cosine-VP follows Nichol and Dhariwal's `s=0.008` cumulative alpha schedule.
+The continuous SDE stops at `t=0.999` to avoid the mathematical singularity at
+`t=1`; its remaining signal coefficient is approximately `1.56e-3`. EDM uses
+the coefficients and defaults from Karras et al.: `sigma_data=0.5`,
+`P_mean=-1.2`, `P_std=1.2`, `sigma_min=0.002`, `sigma_max=80`, and `rho=7`.
+In the controlled EDM variant, the underlying image network remains this
+repository's NCSN++, so that comparison isolates the generative framework. The
+canonical variant instead uses NVLabs' official SongUNet. EDM probability-flow
+BPD is intentionally disabled; sample quality uses the common IS/FID/KID
+protocol. The 18-step Heun sampler uses
+`2 * steps - 1 = 35` network evaluations; when matching an NFE budget, set
+`sampling.edm_num_steps` (or eval-only `eval.sampling_num_scales`) accordingly.
+The official source is not vendored because its CC BY-NC-SA 4.0 license differs
+from this repository's Apache license; see `THIRD_PARTY.md`.
 
 ## What does this code do?
 Aside from the **NCSN++** and **DDPM++** models in our paper, this codebase also re-implements many previous score-based models in one place, including **NCSN** from [Generative Modeling by Estimating Gradients of the Data Distribution](https://arxiv.org/abs/1907.05600), **NCSNv2** from [Improved Techniques for Training Score-Based Generative Models](https://arxiv.org/abs/2006.09011), and **DDPM** from [Denoising Diffusion Probabilistic Models](https://arxiv.org/abs/2006.11239). 

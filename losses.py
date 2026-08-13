@@ -21,6 +21,7 @@ import torch.optim as optim
 import numpy as np
 from models import utils as mutils
 from sde_lib import VESDE, VPSDE
+import edm_lib
 
 
 def get_optimizer(config, params):
@@ -42,9 +43,23 @@ def optimization_manager(config):
                   warmup=config.optim.warmup,
                   grad_clip=config.optim.grad_clip):
     """Optimizes with warmup and gradient clipping (disabled if negative)."""
-    if warmup > 0:
+    params = list(params)
+    warmup_kimg = getattr(config.optim, 'warmup_kimg', None)
+    if warmup_kimg is not None:
+      warmup_nimg = warmup_kimg * 1000.0
+      effective_batch_size = getattr(
+        config.training, 'effective_batch_size', config.training.batch_size)
+      lr_scale = np.minimum(step * effective_batch_size / max(warmup_nimg, 1e-8), 1.0)
+      for g in optimizer.param_groups:
+        g['lr'] = lr * lr_scale
+    elif warmup > 0:
       for g in optimizer.param_groups:
         g['lr'] = lr * np.minimum(step / warmup, 1.0)
+    if getattr(config.optim, 'sanitize_gradients', False):
+      for param in params:
+        if param.grad is not None:
+          torch.nan_to_num(param.grad, nan=0.0, posinf=1e5, neginf=-1e5,
+                           out=param.grad)
     if grad_clip >= 0:
       torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
     optimizer.step()
@@ -101,6 +116,37 @@ def get_sde_loss_fn(sde, train, reduce_mean=True, continuous=True, likelihood_we
   return loss_fn
 
 
+def get_edm_loss_fn(edm, train, reduce_mean=True):
+  """EDM denoising loss from Karras et al., Eq. (5) and Table 1."""
+
+  def loss_fn(model, batch):
+    # Match the official EDMLoss RNG order: sigma, augmentation, additive noise.
+    rnd_normal = torch.randn(batch.shape[0], device=batch.device, dtype=batch.dtype)
+    sigma = torch.exp(rnd_normal * edm.p_std + edm.p_mean)
+    target = batch
+    augment_labels = None
+    if edm.augmentation and train:
+      model_without_parallel = model.module if hasattr(model, 'module') else model
+      if not hasattr(model_without_parallel, 'augment'):
+        raise ValueError('EDM augmentation was enabled but the model has no augment() method.')
+      target, augment_labels = model_without_parallel.augment(batch)
+    noise = torch.randn_like(target) * sigma[:, None, None, None]
+    if augment_labels is None:
+      denoised = model(target + noise, sigma)
+    else:
+      denoised = model(target + noise, sigma, augment_labels)
+    weight = ((sigma ** 2 + edm.sigma_data ** 2)
+              / (sigma * edm.sigma_data) ** 2)
+    per_element = weight[:, None, None, None] * torch.square(denoised - target)
+    if reduce_mean:
+      return torch.mean(per_element)
+    # Official EDM calls loss.sum() / batch_gpu_total. Keeping the same global
+    # reduction also preserves its floating-point reduction order.
+    return torch.sum(per_element) / per_element.shape[0]
+
+  return loss_fn
+
+
 def get_smld_loss_fn(vesde, train, reduce_mean=False):
   """Legacy code to reproduce previous results on SMLD(NCSN). Not recommended for new work."""
   assert isinstance(vesde, VESDE), "SMLD training only works for VESDEs."
@@ -148,7 +194,8 @@ def get_ddpm_loss_fn(vpsde, train, reduce_mean=True):
   return loss_fn
 
 
-def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False):
+def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True,
+                likelihood_weighting=False, ema_decay_fn=None):
   """Create a one-step training/evaluation function.
 
   Args:
@@ -162,7 +209,9 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
   Returns:
     A one-step function for training or evaluation.
   """
-  if continuous:
+  if isinstance(sde, edm_lib.EDM):
+    loss_fn = get_edm_loss_fn(sde, train, reduce_mean=reduce_mean)
+  elif continuous:
     loss_fn = get_sde_loss_fn(sde, train, reduce_mean=reduce_mean,
                               continuous=True, likelihood_weighting=likelihood_weighting)
   else:
@@ -192,11 +241,23 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
     if train:
       optimizer = state['optimizer']
       optimizer.zero_grad()
-      loss = loss_fn(model, batch)
-      loss.backward()
-      optimize_fn(optimizer, model.parameters(), step=state['step'])
+      if isinstance(batch, (list, tuple)):
+        if not batch:
+          raise ValueError('Gradient accumulation received no microbatches.')
+        accumulated_loss = 0.0
+        for microbatch in batch:
+          microbatch_loss = loss_fn(model, microbatch)
+          (microbatch_loss / len(batch)).backward()
+          accumulated_loss = accumulated_loss + microbatch_loss.detach()
+        loss = accumulated_loss / len(batch)
+      else:
+        loss = loss_fn(model, batch)
+        loss.backward()
+      current_step = state['step']
+      optimize_fn(optimizer, model.parameters(), step=current_step)
       state['step'] += 1
-      state['ema'].update(model.parameters())
+      ema_decay = None if ema_decay_fn is None else ema_decay_fn(current_step)
+      state['ema'].update(model.parameters(), decay=ema_decay)
     else:
       with torch.no_grad():
         ema = state['ema']
@@ -208,3 +269,22 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
     return loss
 
   return step_fn
+
+
+def get_ema_decay_fn(config):
+  """Return the image-count EMA schedule used by the official EDM recipe."""
+  if config.training.sde.lower() != 'edm':
+    return None
+  batch_size = getattr(
+    config.training, 'effective_batch_size', config.training.batch_size)
+  halflife_nimg = config.model.edm_ema_halflife_kimg * 1000.0
+  rampup_ratio = config.model.edm_ema_rampup_ratio
+
+  def decay_fn(step):
+    current_nimg = step * batch_size
+    current_halflife = halflife_nimg
+    if rampup_ratio is not None:
+      current_halflife = min(current_halflife, current_nimg * rampup_ratio)
+    return 0.5 ** (batch_size / max(current_halflife, 1e-8))
+
+  return decay_fn

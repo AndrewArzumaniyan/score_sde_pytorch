@@ -37,7 +37,7 @@ import tensorflow as tf
 import tensorflow_gan as tfgan
 import logging
 # Keep the import below for registering all model definitions
-from models import ddpm, ncsnv2, ncsnpp
+from models import ddpm, edm, edm_canonical, ncsnv2, ncsnpp
 import losses
 import sampling
 from models import utils as mutils
@@ -46,6 +46,7 @@ import datasets
 import evaluation
 import likelihood
 import sde_lib
+import edm_lib
 from absl import flags
 from utils import save_checkpoint, restore_checkpoint
 
@@ -59,6 +60,13 @@ def get_sde(config, n_override=None):
     return sde_lib.VPSDE(
       beta_min=config.model.beta_min,
       beta_max=config.model.beta_max,
+      N=num_scales,
+    ), 1e-3
+  if sde_name == 'cosinevpsde':
+    return sde_lib.CosineVPSDE(
+      s=config.model.cosine_s,
+      t_max=config.model.cosine_t_max,
+      max_beta=config.model.cosine_max_beta,
       N=num_scales,
     ), 1e-3
   if sde_name == 'subvpsde':
@@ -89,6 +97,23 @@ def get_sde(config, n_override=None):
       target_terminal_variance=getattr(config.model, 'fox_target_terminal_variance', None),
       N=num_scales,
     ), 1e-3
+  if sde_name == 'edm':
+    num_steps = (getattr(config.sampling, 'edm_num_steps', 18)
+                 if n_override is None else n_override)
+    return edm_lib.EDM(
+      sigma_data=config.model.edm_sigma_data,
+      p_mean=config.training.edm_p_mean,
+      p_std=config.training.edm_p_std,
+      sigma_min=config.sampling.edm_sigma_min,
+      sigma_max=config.sampling.edm_sigma_max,
+      rho=config.sampling.edm_rho,
+      s_churn=config.sampling.edm_s_churn,
+      s_min=config.sampling.edm_s_min,
+      s_max=config.sampling.edm_s_max,
+      s_noise=config.sampling.edm_s_noise,
+      augmentation=getattr(config.training, 'edm_augmentation', False),
+      N=num_steps,
+    ), 0.0
   raise NotImplementedError(f"SDE {config.training.sde} unknown.")
 
 
@@ -142,9 +167,11 @@ def train(config, workdir):
   continuous = config.training.continuous
   reduce_mean = config.training.reduce_mean
   likelihood_weighting = config.training.likelihood_weighting
+  ema_decay_fn = losses.get_ema_decay_fn(config)
   train_step_fn = losses.get_step_fn(sde, train=True, optimize_fn=optimize_fn,
                                      reduce_mean=reduce_mean, continuous=continuous,
-                                     likelihood_weighting=likelihood_weighting)
+                                     likelihood_weighting=likelihood_weighting,
+                                     ema_decay_fn=ema_decay_fn)
   eval_step_fn = losses.get_step_fn(sde, train=False, optimize_fn=optimize_fn,
                                     reduce_mean=reduce_mean, continuous=continuous,
                                     likelihood_weighting=likelihood_weighting)
@@ -161,10 +188,16 @@ def train(config, workdir):
   logging.info("Starting training loop at step %d." % (initial_step,))
 
   for step in range(initial_step, num_train_steps + 1):
-    # Convert data to JAX arrays and normalize them. Use ._numpy() to avoid copy.
-    batch = torch.from_numpy(next(train_iter)['image']._numpy()).to(config.device).float()
-    batch = batch.permute(0, 3, 1, 2)
-    batch = scaler(batch)
+    accumulation_steps = getattr(config.training, 'gradient_accumulation_steps', 1)
+    if accumulation_steps < 1:
+      raise ValueError('training.gradient_accumulation_steps must be positive.')
+    microbatches = []
+    for _ in range(accumulation_steps):
+      # Convert data to Torch tensors and normalize them. Use ._numpy() to avoid copy.
+      microbatch = torch.from_numpy(next(train_iter)['image']._numpy()).to(config.device).float()
+      microbatch = microbatch.permute(0, 3, 1, 2)
+      microbatches.append(scaler(microbatch))
+    batch = microbatches[0] if accumulation_steps == 1 else microbatches
     # Execute one training step
     loss = train_step_fn(state, batch)
     if step % config.training.log_freq == 0:
@@ -278,6 +311,8 @@ def evaluate(config,
 
   # Build the likelihood computation function when likelihood is enabled
   if config.eval.enable_bpd:
+    if isinstance(sde, edm_lib.EDM):
+      raise ValueError('Probability-flow BPD is not defined for the EDM baseline.')
     likelihood_fn = likelihood.get_likelihood_fn(sde, inverse_scaler)
 
   # Build the sampling function when sampling is enabled

@@ -164,6 +164,91 @@ class VPSDE(SDE):
     return f, G
 
 
+class CosineVPSDE(VPSDE):
+  """VP SDE with the cosine cumulative-noise schedule of Nichol & Dhariwal.
+
+  The paper defines
+
+    alpha_bar(t) = f(t) / f(0),
+    f(t) = cos^2(((t + s) / (1 + s)) * pi / 2),  s = 0.008.
+
+  Its continuous-time beta diverges at t=1.  We therefore integrate up to
+  ``t_max`` (0.999 by default), where the residual signal is already
+  negligible, while retaining the paper's max_beta=0.999 safeguard for the
+  cached discrete schedule.
+  """
+
+  def __init__(self, s=0.008, t_max=0.999, max_beta=0.999, N=1000):
+    SDE.__init__(self, N)
+    if s < 0.0:
+      raise ValueError('cosine schedule offset s must be non-negative.')
+    if not 0.0 < t_max < 1.0:
+      raise ValueError('cosine t_max must lie strictly between 0 and 1.')
+    if not 0.0 < max_beta < 1.0:
+      raise ValueError('cosine max_beta must lie strictly between 0 and 1.')
+    self.s = float(s)
+    self.t_max = float(t_max)
+    self.max_beta = float(max_beta)
+    self.N = int(N)
+    self._theta_0 = self.s / (1.0 + self.s) * np.pi / 2.0
+    self._f0 = float(np.cos(self._theta_0) ** 2)
+
+    # Same alpha_bar discretization and beta clipping as improved-diffusion,
+    # evaluated over the numerically safe continuous horizon [0, t_max].
+    edges = np.linspace(0.0, self.t_max, self.N + 1, dtype=np.float64)
+    alpha_bar = self._alpha_bar_np(edges)
+    betas = np.minimum(1.0 - alpha_bar[1:] / alpha_bar[:-1], self.max_beta)
+    self.discrete_betas = torch.from_numpy(betas.astype(np.float32))
+    self.alphas = 1.0 - self.discrete_betas
+    self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+    self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+    self.sqrt_1m_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+
+  @property
+  def T(self):
+    return self.t_max
+
+  def _alpha_bar_np(self, t):
+    theta = (t + self.s) / (1.0 + self.s) * np.pi / 2.0
+    return np.cos(theta) ** 2 / self._f0
+
+  def alpha_bar(self, t):
+    t = torch.clamp(t, 0.0, self.T)
+    theta = (t + self.s) / (1.0 + self.s) * np.pi / 2.0
+    return torch.clamp(torch.cos(theta) ** 2 / self._f0, min=0.0, max=1.0)
+
+  def beta(self, t):
+    t = torch.clamp(t, 0.0, self.T)
+    theta = (t + self.s) / (1.0 + self.s) * np.pi / 2.0
+    return np.pi / (1.0 + self.s) * torch.tan(theta)
+
+  def sde(self, x, t):
+    beta_t = self.beta(t)
+    drift = -0.5 * beta_t[:, None, None, None] * x
+    diffusion = torch.sqrt(beta_t)
+    return drift, diffusion
+
+  def marginal_prob(self, x, t):
+    alpha_bar = self.alpha_bar(t)
+    mean = torch.sqrt(alpha_bar)[:, None, None, None] * x
+    std = torch.sqrt(torch.clamp(1.0 - alpha_bar, min=0.0))
+    return mean, std
+
+  def prior_sampling(self, shape):
+    return torch.randn(*shape)
+
+  def prior_logp(self, z):
+    shape = z.shape
+    num_dims = np.prod(shape[1:])
+    reduce_dims = tuple(range(1, len(shape)))
+    return -num_dims / 2.0 * np.log(2 * np.pi) - torch.sum(z ** 2, dim=reduce_dims) / 2.0
+
+  def discretize(self, x, t):
+    # Euler discretization is consistent with the continuous cosine SDE and
+    # avoids silently using VPSDE's linear-beta DDPM coefficients.
+    return SDE.discretize(self, x, t)
+
+
 class subVPSDE(SDE):
   def __init__(self, beta_min=0.1, beta_max=20, N=1000):
     """Construct the sub-VP SDE that excels at likelihoods.
