@@ -50,6 +50,7 @@ RUN python -m pip install -r /tmp/requirements.base.txt
 
 RUN python -m pip install \
     --index-url https://download.pytorch.org/whl/cu121 \
+    --extra-index-url https://pypi.org/simple \
     torch==2.4.1 torchvision==0.19.1 \
     && python -m pip install typing-extensions==4.12.2
 
