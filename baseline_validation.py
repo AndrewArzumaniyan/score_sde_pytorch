@@ -30,6 +30,29 @@ class CaptureConditioning(torch.nn.Module):
     return torch.zeros_like(x)
 
 
+class CaptureModeDenoiser(torch.nn.Module):
+  def __init__(self):
+    super().__init__()
+    self.scale = torch.nn.Parameter(torch.ones(()))
+    self.observed_modes = []
+
+  def forward(self, x, sigma):
+    del sigma
+    self.observed_modes.append(self.training)
+    return x * self.scale
+
+
+class CountingScoreModel(torch.nn.Module):
+  def __init__(self):
+    super().__init__()
+    self.calls = 0
+
+  def forward(self, x, labels):
+    del labels
+    self.calls += 1
+    return torch.zeros_like(x)
+
+
 class BaselineValidationTest(unittest.TestCase):
 
   def test_cosine_alpha_bar_matches_improved_ddpm_formula(self):
@@ -110,6 +133,43 @@ class BaselineValidationTest(unittest.TestCase):
     self.assertTrue(torch.isfinite(samples).all())
     self.assertEqual(nfe, 2 * edm.N - 1)
     self.assertLess(float(torch.max(torch.abs(samples))), 1e-5)
+
+  def test_edm_sampler_uses_eval_mode_and_restores_training_mode(self):
+    edm = edm_lib.EDM(N=3)
+    model = CaptureModeDenoiser()
+    model.train()
+    sampler = sampling.get_edm_sampler(
+      edm, (1, 1, 4, 4), inverse_scaler=lambda x: x, device='cpu')
+    sampler(model)
+    self.assertTrue(model.training)
+    self.assertEqual(model.observed_modes, [False] * (2 * edm.N - 1))
+
+  def test_edm_eval_loss_uses_eval_mode_and_restores_training_mode(self):
+    edm = edm_lib.EDM()
+    model = CaptureModeDenoiser()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    ema = ExponentialMovingAverage(model.parameters(), decay=0.999)
+    state = dict(optimizer=optimizer, model=model, ema=ema, step=0)
+    step_fn = losses.get_step_fn(edm, train=False, reduce_mean=True)
+    model.train()
+    loss = step_fn(state, torch.randn(2, 1, 4, 4))
+    self.assertTrue(torch.isfinite(loss))
+    self.assertTrue(model.training)
+    self.assertEqual(model.observed_modes, [False])
+
+  def test_pc_nfe_excludes_none_corrector(self):
+    sde = sde_lib.VPSDE(N=4)
+    model = CountingScoreModel()
+    sampler = sampling.get_pc_sampler(
+      sde=sde, shape=(1, 1, 4, 4),
+      predictor=sampling.EulerMaruyamaPredictor,
+      corrector=sampling.NoneCorrector,
+      inverse_scaler=lambda x: x, snr=0.1, n_steps=1,
+      continuous=True, device='cpu')
+    samples, nfe = sampler(model)
+    self.assertTrue(torch.isfinite(samples).all())
+    self.assertEqual(model.calls, 4)
+    self.assertEqual(nfe, 4)
 
   def test_existing_ema_update_is_unchanged_without_schedule(self):
     parameter = torch.nn.Parameter(torch.tensor([2.0]))

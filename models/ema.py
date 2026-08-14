@@ -29,6 +29,21 @@ class ExponentialMovingAverage:
                           for p in parameters if p.requires_grad]
     self.collected_params = []
 
+  def _checked_trainable_parameters(self, parameters):
+    parameters = [p for p in parameters if p.requires_grad]
+    if len(parameters) != len(self.shadow_params):
+      raise ValueError(
+        'EMA/model parameter count mismatch: '
+        f'{len(self.shadow_params)} shadow tensors for {len(parameters)} '
+        'trainable model tensors.')
+    for index, (shadow, parameter) in enumerate(
+        zip(self.shadow_params, parameters)):
+      if shadow.shape != parameter.shape:
+        raise ValueError(
+          f'EMA/model shape mismatch at parameter {index}: '
+          f'{tuple(shadow.shape)} vs {tuple(parameter.shape)}.')
+    return parameters
+
   def update(self, parameters, decay=None):
     """
     Update currently maintained parameters.
@@ -49,7 +64,7 @@ class ExponentialMovingAverage:
       decay = min(decay, (1 + self.num_updates) / (10 + self.num_updates))
     one_minus_decay = 1.0 - decay
     with torch.no_grad():
-      parameters = [p for p in parameters if p.requires_grad]
+      parameters = self._checked_trainable_parameters(parameters)
       for s_param, param in zip(self.shadow_params, parameters):
         s_param.sub_(one_minus_decay * (s_param - param))
 
@@ -61,7 +76,7 @@ class ExponentialMovingAverage:
       parameters: Iterable of `torch.nn.Parameter`; the parameters to be
         updated with the stored moving averages.
     """
-    parameters = [p for p in parameters if p.requires_grad]
+    parameters = self._checked_trainable_parameters(parameters)
     for s_param, param in zip(self.shadow_params, parameters):
       if param.requires_grad:
         param.data.copy_(s_param.data)
@@ -88,7 +103,18 @@ class ExponentialMovingAverage:
       parameters: Iterable of `torch.nn.Parameter`; the parameters to be
         updated with the stored parameters.
     """
-    for c_param, param in zip(self.collected_params, parameters):
+    parameters = list(parameters)
+    if len(self.collected_params) != len(parameters):
+      raise ValueError(
+        'EMA restore parameter count mismatch: '
+        f'{len(self.collected_params)} stored tensors for {len(parameters)} '
+        'model tensors.')
+    for index, (c_param, param) in enumerate(
+        zip(self.collected_params, parameters)):
+      if c_param.shape != param.shape:
+        raise ValueError(
+          f'EMA restore shape mismatch at parameter {index}: '
+          f'{tuple(c_param.shape)} vs {tuple(param.shape)}.')
       param.data.copy_(c_param.data)
 
   def state_dict(self):
@@ -96,6 +122,17 @@ class ExponentialMovingAverage:
                 shadow_params=self.shadow_params)
 
   def load_state_dict(self, state_dict):
+    shadow_params = state_dict['shadow_params']
+    if len(shadow_params) != len(self.shadow_params):
+      raise ValueError(
+        'Checkpoint EMA parameter count does not match the current model: '
+        f'{len(shadow_params)} vs {len(self.shadow_params)}.')
+    for index, (loaded, current) in enumerate(
+        zip(shadow_params, self.shadow_params)):
+      if loaded.shape != current.shape:
+        raise ValueError(
+          f'Checkpoint EMA shape mismatch at parameter {index}: '
+          f'{tuple(loaded.shape)} vs {tuple(current.shape)}.')
     self.decay = state_dict['decay']
     self.num_updates = state_dict['num_updates']
-    self.shadow_params = state_dict['shadow_params']
+    self.shadow_params = shadow_params

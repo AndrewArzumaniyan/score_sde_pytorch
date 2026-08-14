@@ -38,6 +38,10 @@ def get_default_configs():
   evaluate.enable_bpd = False
   evaluate.bpd_dataset = 'test'
   evaluate.sampling_num_scales = 0
+  evaluate.sampling_seed = 0
+  evaluate.loss_seed = 0
+  evaluate.bpd_seed = 0
+  evaluate.include_final_checkpoint = False
 
   # data
   config.data = data = ml_collections.ConfigDict()
@@ -70,6 +74,10 @@ def get_default_configs():
   optim.grad_clip = 1.
 
   config.seed = 42
+  config.deterministic = False
+  config.cudnn_benchmark = False
+  config.allow_tf32 = False
+  config.allow_fp16_reduced_precision_reduction = False
   config.device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
   return config

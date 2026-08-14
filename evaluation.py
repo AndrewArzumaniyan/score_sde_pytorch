@@ -16,7 +16,7 @@
 """Utility functions for computing FID/Inception scores."""
 
 import gc
-import io
+import hashlib
 import os
 
 import numpy as np
@@ -27,6 +27,7 @@ import tensorflow_gan as tfgan
 import tensorflow_hub as tfhub
 from absl import logging
 import datasets as datasets_lib
+from artifact_utils import atomic_savez
 
 try:
   import jax
@@ -68,9 +69,23 @@ def _get_stats_filename(config):
       return f'assets/stats/cifar10_class_{cifar10_class}_{stats_split}_stats.npz'
     if per_class >= 0:
       return f'assets/stats/cifar10_balanced_{per_class}_per_class_{stats_split}_stats.npz'
-    return 'assets/stats/cifar10_stats.npz'
+    if stats_split == 'train':
+      return 'assets/stats/cifar10_stats.npz'
+    return 'assets/stats/cifar10_test_stats.npz'
   elif config.data.dataset == 'CELEBA':
-    return 'assets/stats/celeba_stats.npz'
+    resolution = config.data.image_size
+    source = datasets_lib.get_local_celeba_root(config) or 'tfds'
+    if source != 'tfds':
+      source = os.path.realpath(source)
+      partition_path = os.path.join(source, 'list_eval_partition.txt')
+      source_digest = hashlib.sha256(source.encode('utf-8'))
+      with open(partition_path, 'rb') as partition_file:
+        for block in iter(lambda: partition_file.read(1024 * 1024), b''):
+          source_digest.update(block)
+      source_hash = source_digest.hexdigest()[:12]
+    else:
+      source_hash = hashlib.sha256(b'tfds').hexdigest()[:12]
+    return f'assets/stats/celeba_{resolution}_{source_hash}_stats.npz'
   elif config.data.dataset == 'LSUN':
     return f'assets/stats/lsun_{config.data.category}_{config.data.image_size}_stats.npz'
   else:
@@ -102,12 +117,13 @@ def _compute_cifar10_stats(filename, inception_model, batch_size, config,
     total += int(batch.shape[0])
     logging.info('Computed CIFAR-10 dataset stats for %d examples', total)
 
-  tf.io.gfile.makedirs(os.path.dirname(filename))
   pool_3 = np.concatenate(pools, axis=0)
-  with tf.io.gfile.GFile(filename, 'wb') as fout:
-    io_buffer = io.BytesIO()
-    np.savez_compressed(io_buffer, pool_3=pool_3)
-    fout.write(io_buffer.getvalue())
+  try:
+    atomic_savez(
+      filename, overwrite=False, pool_3=pool_3,
+      split=np.asarray(split), num_examples=np.asarray(pool_3.shape[0]))
+  except FileExistsError:
+    logging.info('Dataset stats were published concurrently: %s', filename)
 
 
 def _preprocess_celeba_image(image, resolution):
@@ -158,12 +174,13 @@ def _compute_celeba_stats(filename, inception_model, batch_size, config):
     total += int(batch.shape[0])
     logging.info('Computed CelebA dataset stats for %d examples', total)
 
-  tf.io.gfile.makedirs(os.path.dirname(filename))
   pool_3 = np.concatenate(pools, axis=0)
-  with tf.io.gfile.GFile(filename, 'wb') as fout:
-    io_buffer = io.BytesIO()
-    np.savez_compressed(io_buffer, pool_3=pool_3)
-    fout.write(io_buffer.getvalue())
+  try:
+    atomic_savez(
+      filename, overwrite=False, pool_3=pool_3,
+      resolution=np.asarray(resolution), num_examples=np.asarray(pool_3.shape[0]))
+  except FileExistsError:
+    logging.info('Dataset stats were published concurrently: %s', filename)
 
 
 def load_dataset_stats(config, inception_model=None):
@@ -190,7 +207,20 @@ def load_dataset_stats(config, inception_model=None):
 
   with tf.io.gfile.GFile(filename, 'rb') as fin:
     stats = np.load(fin)
-    return stats
+    return {key: stats[key] for key in stats.files}
+
+
+def dataset_stats_fingerprint(config):
+  """Content fingerprint used to bind a metric report to reference stats."""
+  filename = _get_stats_filename(config)
+  digest = hashlib.sha256()
+  with tf.io.gfile.GFile(filename, 'rb') as stats_file:
+    while True:
+      block = stats_file.read(1024 * 1024)
+      if not block:
+        break
+      digest.update(block)
+  return digest.hexdigest()
 
 
 def classifier_fn_from_tfhub(output_fields, inception_model,

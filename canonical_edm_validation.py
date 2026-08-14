@@ -41,6 +41,13 @@ class CanonicalEDMValidationTest(unittest.TestCase):
     self.assertFalse(config.data.random_flip)
     self.assertTrue(config.eval.enable_sampling)
     self.assertEqual(config.eval.num_samples, 50000)
+    self.assertEqual(config.eval.end_ckpt, 15)
+    self.assertEqual(config.eval.sampling_seed, 0)
+    self.assertEqual(config.eval.loss_seed, 0)
+    self.assertEqual(config.eval.bpd_seed, 0)
+    self.assertFalse(config.eval.include_final_checkpoint)
+    self.assertFalse(config.allow_tf32)
+    self.assertTrue(config.cudnn_benchmark)
 
   def test_adapter_rejects_unpinned_checkout(self):
     config = self._small_config()
@@ -106,6 +113,9 @@ class CanonicalEDMValidationTest(unittest.TestCase):
 
   def test_loss_backward_and_sampler(self):
     config = self._small_config()
+    # This is a capacity/plumbing diagnostic, not the paper schedule: step 0
+    # of the official 10M-image warmup deliberately has LR=0.
+    config.optim.warmup_kimg = None
     model = CanonicalEDMSongUNet(config)
     design = edm_lib.EDM(augmentation=True, N=3)
     optimizer = losses.get_optimizer(config, model.parameters())
@@ -115,17 +125,22 @@ class CanonicalEDMValidationTest(unittest.TestCase):
       design, train=True, optimize_fn=losses.optimization_manager(config),
       reduce_mean=False, ema_decay_fn=losses.get_ema_decay_fn(config))
     microbatches = [torch.randn(1, 3, 32, 32) for _ in range(4)]
+    before = [parameter.detach().clone() for parameter in model.parameters()]
     loss = step_fn(state, microbatches)
     self.assertTrue(torch.isfinite(loss))
     self.assertEqual(state['step'], 1)
+    self.assertTrue(any(
+      not torch.equal(old, new)
+      for old, new in zip(before, model.parameters())))
 
-    model.eval()
+    model.train()
     sampler = sampling.get_edm_sampler(
       design, (1, 3, 32, 32), inverse_scaler=lambda x: x, device='cpu')
     samples, nfe = sampler(model)
     self.assertTrue(torch.isfinite(samples).all())
     self.assertEqual(samples.shape, (1, 3, 32, 32))
     self.assertEqual(nfe, 5)
+    self.assertTrue(model.training)
 
 
 if __name__ == '__main__':

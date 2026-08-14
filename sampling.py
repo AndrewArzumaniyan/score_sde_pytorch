@@ -138,34 +138,42 @@ def get_edm_sampler(edm, shape, inverse_scaler, device='cuda'):
   """EDM Algorithm 2: Karras grid, optional churn, Euler + Heun correction."""
 
   def edm_sampler(model):
-    with torch.no_grad():
-      t_steps = edm.noise_levels(device=device, dtype=torch.float64)
-      x_next = torch.randn(*shape, device=device, dtype=torch.float64) * t_steps[0]
-      nfe = 0
+    was_training = model.training
+    model.eval()
+    try:
+      with torch.no_grad():
+        t_steps = edm.noise_levels(device=device, dtype=torch.float64)
+        # Official generate.py draws latents in float32 and Algorithm 2 then
+        # promotes them to float64 for the solver.
+        x_next = torch.randn(
+          *shape, device=device, dtype=torch.float32).to(torch.float64) * t_steps[0]
+        nfe = 0
 
-      for index, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
-        x_cur = x_next
-        gamma = edm.churn_gamma(t_cur)
-        t_hat = t_cur * (1.0 + gamma)
-        noise_scale = torch.sqrt(torch.clamp(t_hat ** 2 - t_cur ** 2, min=0.0))
-        x_hat = x_cur + noise_scale * edm.s_noise * torch.randn_like(x_cur)
+        for index, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
+          x_cur = x_next
+          gamma = edm.churn_gamma(t_cur)
+          t_hat = t_cur * (1.0 + gamma)
+          noise_scale = torch.sqrt(torch.clamp(t_hat ** 2 - t_cur ** 2, min=0.0))
+          x_hat = x_cur + noise_scale * edm.s_noise * torch.randn_like(x_cur)
 
-        sigma_hat = torch.full(
-          (shape[0],), float(t_hat), device=device, dtype=torch.float32)
-        denoised = model(x_hat.to(torch.float32), sigma_hat).to(torch.float64)
-        nfe += 1
-        d_cur = (x_hat - denoised) / t_hat
-        x_next = x_hat + (t_next - t_hat) * d_cur
-
-        if index < edm.N - 1:
-          sigma_next = torch.full(
-            (shape[0],), float(t_next), device=device, dtype=torch.float32)
-          denoised_next = model(x_next.to(torch.float32), sigma_next).to(torch.float64)
+          sigma_hat = torch.full(
+            (shape[0],), float(t_hat), device=device, dtype=torch.float32)
+          denoised = model(x_hat.to(torch.float32), sigma_hat).to(torch.float64)
           nfe += 1
-          d_prime = (x_next - denoised_next) / t_next
-          x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+          d_cur = (x_hat - denoised) / t_hat
+          x_next = x_hat + (t_next - t_hat) * d_cur
 
-      return inverse_scaler(x_next.to(torch.float32)), nfe
+          if index < edm.N - 1:
+            sigma_next = torch.full(
+              (shape[0],), float(t_next), device=device, dtype=torch.float32)
+            denoised_next = model(x_next.to(torch.float32), sigma_next).to(torch.float64)
+            nfe += 1
+            d_prime = (x_next - denoised_next) / t_next
+            x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+
+        return inverse_scaler(x_next.to(torch.float32)), nfe
+    finally:
+      model.train(was_training)
 
   return edm_sampler
 
@@ -439,6 +447,9 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
                                           continuous=continuous,
                                           snr=snr,
                                           n_steps=n_steps)
+  predictor_nfe = 0 if predictor in (None, NonePredictor) else 1
+  corrector_nfe = 0 if corrector in (None, NoneCorrector) else n_steps
+  nfe = sde.N * (predictor_nfe + corrector_nfe)
 
   def get_time_grid():
     if isinstance(sde, sde_lib.FoxVPSDE):
@@ -466,7 +477,7 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
         x, x_mean = corrector_update_fn(x, vec_t, model=model)
         x, x_mean = predictor_update_fn(x, vec_t, model=model, dt=dt)
 
-      return inverse_scaler(x_mean if denoise else x), sde.N * (n_steps + 1)
+      return inverse_scaler(x_mean if denoise else x), nfe
 
   return pc_sampler
 

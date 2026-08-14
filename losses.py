@@ -239,6 +239,7 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
     """
     model = state['model']
     if train:
+      model.train()
       optimizer = state['optimizer']
       optimizer.zero_grad()
       if isinstance(batch, (list, tuple)):
@@ -259,12 +260,17 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
       ema_decay = None if ema_decay_fn is None else ema_decay_fn(current_step)
       state['ema'].update(model.parameters(), decay=ema_decay)
     else:
-      with torch.no_grad():
-        ema = state['ema']
-        ema.store(model.parameters())
-        ema.copy_to(model.parameters())
-        loss = loss_fn(model, batch)
+      was_training = model.training
+      model.eval()
+      ema = state['ema']
+      ema.store(model.parameters())
+      try:
+        with torch.no_grad():
+          ema.copy_to(model.parameters())
+          loss = loss_fn(model, batch)
+      finally:
         ema.restore(model.parameters())
+        model.train(was_training)
 
     return loss
 

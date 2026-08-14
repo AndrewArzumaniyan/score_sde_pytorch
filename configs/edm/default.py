@@ -45,6 +45,9 @@ def apply_edm_defaults(config):
 def apply_canonical_edm_defaults(config):
   """Official NVLabs EDM DDPM++/SongUNet recipe at a 200M-image budget."""
   config = apply_edm_defaults(config)
+  # Official training_loop.py enables cuDNN benchmarking and explicitly
+  # disables TF32/reduced-precision reductions (the latter live in the base).
+  config.cudnn_benchmark = True
   config.training.batch_size = 128
   config.training.effective_batch_size = 512
   config.training.gradient_accumulation_steps = 4

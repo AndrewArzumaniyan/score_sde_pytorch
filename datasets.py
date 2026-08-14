@@ -20,6 +20,8 @@ import os
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
+from reproducibility import derive_seed
+
 try:
   import jax
 except ImportError:
@@ -266,7 +268,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
 
   # Customize preprocess functions for each dataset.
   if config.data.dataset in ['FFHQ', 'CelebAHQ']:
-    def preprocess_fn(d):
+    def preprocess_fn(d, is_training, example_index, dataset_seed):
       sample = tf.io.parse_single_example(d, features={
         'shape': tf.io.FixedLenFeature([3], tf.int64),
         'data': tf.io.FixedLenFeature([], tf.string)})
@@ -274,29 +276,59 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
       data = tf.reshape(data, sample['shape'])
       data = tf.transpose(data, (1, 2, 0))
       img = tf.image.convert_image_dtype(data, tf.float32)
-      if config.data.random_flip and not evaluation:
-        img = tf.image.random_flip_left_right(img)
+      if config.data.random_flip and is_training:
+        flip_seed = tf.stack([
+          tf.cast(derive_seed(dataset_seed, 'flip'), tf.int32),
+          tf.cast(tf.math.floormod(example_index, 2 ** 31 - 1), tf.int32),
+        ])
+        should_flip = tf.random.stateless_uniform(
+          [], seed=flip_seed, dtype=tf.float32) < 0.5
+        img = tf.cond(
+          should_flip, lambda: tf.image.flip_left_right(img), lambda: img)
       if uniform_dequantization:
-        img = (tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.) / 256.
+        dequant_seed = tf.stack([
+          tf.cast(derive_seed(dataset_seed, 'dequantization'), tf.int32),
+          tf.cast(tf.math.floormod(example_index, 2 ** 31 - 1), tf.int32),
+        ])
+        img = (tf.random.stateless_uniform(
+          tf.shape(img), seed=dequant_seed, dtype=tf.float32) + img * 255.) / 256.
       return dict(image=img, label=None)
 
   else:
-    def preprocess_fn(d):
+    def preprocess_fn(d, is_training, example_index, dataset_seed):
       """Basic preprocessing function scales data to [0, 1) and randomly flips."""
       img = resize_op(d['image'])
-      if config.data.random_flip and not evaluation:
-        img = tf.image.random_flip_left_right(img)
+      if config.data.random_flip and is_training:
+        flip_seed = tf.stack([
+          tf.cast(derive_seed(dataset_seed, 'flip'), tf.int32),
+          tf.cast(tf.math.floormod(example_index, 2 ** 31 - 1), tf.int32),
+        ])
+        should_flip = tf.random.stateless_uniform(
+          [], seed=flip_seed, dtype=tf.float32) < 0.5
+        img = tf.cond(
+          should_flip, lambda: tf.image.flip_left_right(img), lambda: img)
       if uniform_dequantization:
-        img = (tf.random.uniform(img.shape, dtype=tf.float32) + img * 255.) / 256.
+        dequant_seed = tf.stack([
+          tf.cast(derive_seed(dataset_seed, 'dequantization'), tf.int32),
+          tf.cast(tf.math.floormod(example_index, 2 ** 31 - 1), tf.int32),
+        ])
+        img = (tf.random.stateless_uniform(
+          tf.shape(img), seed=dequant_seed, dtype=tf.float32) + img * 255.) / 256.
 
       return dict(image=img, label=d.get('label', None))
 
-  def create_dataset(dataset_builder, split):
+  def create_dataset(dataset_builder, split, is_training):
+    dataset_seed = derive_seed(config.seed, 'tf-data', split,
+                               'train' if is_training else 'eval')
     dataset_options = tf.data.Options()
     dataset_options.experimental_optimization.map_parallelization = True
     dataset_options.experimental_threading.private_threadpool_size = 48
     dataset_options.experimental_threading.max_intra_op_parallelism = 1
-    read_config = tfds.ReadConfig(options=dataset_options)
+    dataset_options.experimental_deterministic = True
+    read_config = tfds.ReadConfig(
+      options=dataset_options,
+      shuffle_seed=dataset_seed,
+      shuffle_reshuffle_each_iteration=is_training)
     if config.data.dataset == 'CELEBA' and isinstance(dataset_builder, str):
       image_paths = get_local_celeba_split_paths(split, config)
       if image_paths is None:
@@ -314,17 +346,26 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
     elif isinstance(dataset_builder, tfds.core.DatasetBuilder):
       dataset_builder.download_and_prepare()
       ds = dataset_builder.as_dataset(
-        split=split, shuffle_files=True, read_config=read_config)
+        split=split, shuffle_files=is_training, read_config=read_config)
     else:
       ds = dataset_builder.with_options(dataset_options)
     if config.data.dataset == 'CIFAR10':
       ds = select_cifar10_subset(ds, config, split)
     ds = ds.repeat(count=num_epochs)
-    ds = ds.shuffle(shuffle_buffer_size)
-    ds = ds.map(preprocess_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    if is_training:
+      ds = ds.shuffle(
+        shuffle_buffer_size, seed=dataset_seed,
+        reshuffle_each_iteration=True)
+    ds = ds.enumerate()
+    ds = ds.map(
+      lambda index, example: preprocess_fn(
+        example, is_training=is_training, example_index=index,
+        dataset_seed=dataset_seed),
+      num_parallel_calls=tf.data.experimental.AUTOTUNE)
     ds = ds.batch(batch_size, drop_remainder=True)
     return ds.prefetch(prefetch_size)
 
-  train_ds = create_dataset(dataset_builder, train_split_name)
-  eval_ds = create_dataset(dataset_builder, eval_split_name)
+  train_ds = create_dataset(
+    dataset_builder, train_split_name, is_training=not evaluation)
+  eval_ds = create_dataset(dataset_builder, eval_split_name, is_training=False)
   return train_ds, eval_ds, dataset_builder

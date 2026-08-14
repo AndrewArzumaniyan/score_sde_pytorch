@@ -38,7 +38,8 @@ def _load_official_modules(config):
     config.model, 'edm_official_commit', OFFICIAL_EDM_COMMIT)
   try:
     actual_commit = subprocess.check_output(
-      ['git', '-C', root, 'rev-parse', 'HEAD'], text=True,
+      ['git', '-c', f'safe.directory={root}', '-C', root,
+       'rev-parse', 'HEAD'], text=True,
       stderr=subprocess.DEVNULL).strip()
   except (OSError, subprocess.CalledProcessError) as error:
     raise RuntimeError(
@@ -48,6 +49,13 @@ def _load_official_modules(config):
     raise RuntimeError(
       f'Official EDM checkout is at {actual_commit}; expected '
       f'{expected_commit}. Re-run `tools/install_official_edm.sh`.')
+  dirty_files = subprocess.check_output(
+    ['git', '-c', f'safe.directory={root}', '-C', root, 'status',
+     '--porcelain', '--untracked-files=no'], text=True).strip()
+  if dirty_files:
+    raise RuntimeError(
+      'Official EDM tracked sources have local modifications; pinned parity '
+      f'cannot be guaranteed: {root}\n{dirty_files}')
   if root not in sys.path:
     sys.path.insert(0, root)
   networks = importlib.import_module('training.networks')

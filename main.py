@@ -47,15 +47,25 @@ def main(argv):
     tf.io.gfile.makedirs(FLAGS.workdir)
     # Set logger so that it outputs to both console and file
     # Make logging work for both disk and Google Cloud Storage
-    gfile_stream = open(os.path.join(FLAGS.workdir, 'stdout.txt'), 'w')
+    # Preserve earlier invocations when resuming the same workdir.
+    gfile_stream = open(os.path.join(FLAGS.workdir, 'stdout.txt'), 'a')
     handler = logging.StreamHandler(gfile_stream)
     formatter = logging.Formatter('%(levelname)s - %(filename)s - %(asctime)s - %(message)s')
     handler.setFormatter(formatter)
     logger = logging.getLogger()
     logger.addHandler(handler)
     logger.setLevel('INFO')
-    # Run the training pipeline
-    run_lib.train(FLAGS.config, FLAGS.workdir)
+    logger.info('=== training invocation started ===')
+    try:
+      # Run the training pipeline
+      run_lib.train(FLAGS.config, FLAGS.workdir)
+    except Exception:
+      logger.exception('Training invocation failed.')
+      raise
+    finally:
+      handler.flush()
+      logger.removeHandler(handler)
+      gfile_stream.close()
   elif FLAGS.mode == "eval":
     # Run the evaluation pipeline
     run_lib.evaluate(FLAGS.config, FLAGS.workdir, FLAGS.eval_folder)
