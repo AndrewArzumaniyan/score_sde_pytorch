@@ -73,6 +73,10 @@ python main.py --mode=eval \
   --workdir=workdirs/cifar10_edm_canonical --eval_folder=eval
 ```
 
+Do this in the host checkout before starting a bind-mounted Docker run. The
+repository mount hides the copy installed inside the image; installing from a
+root container can also leave host files owned by root.
+
 The canonical recipe uses an effective batch of 512 as four microbatches of
 128, a 200M-image training budget, official 10M-image LR warmup, 500k-image
 EMA half-life, and augmentation probability 0.12. The CelebA config transfers
@@ -95,7 +99,8 @@ The continuous SDE stops at `t=0.999` to avoid the mathematical singularity at
 the coefficients and defaults from Karras et al.: `sigma_data=0.5`,
 `P_mean=-1.2`, `P_std=1.2`, `sigma_min=0.002`, `sigma_max=80`, and `rho=7`.
 In the controlled EDM variant, the underlying image network remains this
-repository's NCSN++, so that comparison isolates the generative framework. The
+repository's NCSN++, so it controls the image architecture, but its current
+10M-image EDM warmup is not optimizer-matched to the older VP/FOX runs. The
 canonical variant instead uses NVLabs' official SongUNet. EDM probability-flow
 BPD is intentionally disabled; sample quality uses the common IS/FID/KID
 protocol. The 18-step Heun sampler uses
@@ -103,6 +108,34 @@ protocol. The 18-step Heun sampler uses
 `sampling.edm_num_steps` (or eval-only `eval.sampling_num_scales`) accordingly.
 The official source is not vendored because its CC BY-NC-SA 4.0 license differs
 from this repository's Apache license; see `THIRD_PARTY.md`.
+
+### Reproducibility and artifact identity
+
+`config.seed` is applied to Python, NumPy, PyTorch, TensorFlow, TFDS shuffle,
+and stateless per-example preprocessing. Snapshot/eval RNG streams are isolated
+from training; standalone sampling, loss, and BPD use `eval.sampling_seed`,
+`eval.loss_seed`, and `eval.bpd_seed` respectively.
+
+Each new training workdir contains `run_manifest.json`. Checkpoints are atomic,
+periodic checkpoints are immutable, and incompatible code/config/seed resumes
+fail instead of partially loading. A non-boundary final state is stored as
+`checkpoint_final_step_<actual_step>.pth`; set
+`eval.include_final_checkpoint=True` with the matching `training.n_iters` to
+evaluate it. Each eval folder also has a manifest, so artifacts from another
+checkpoint, sampler, seed, sample count, code version, or reference-statistics
+file are not silently reused. Use a new eval folder after protocol changes.
+
+The default contract fixes stochastic streams, data order, and artifact
+provenance for an unchanged container, dataset, and GPU topology. It does not
+guarantee identical weights or sample bytes, even on the same GPU, because the
+canonical recipe keeps cuDNN benchmarking enabled. `deterministic=True` is a
+strict fail-fast diagnostic mode and additionally requires `PYTHONHASHSEED`,
+`TF_DETERMINISTIC_OPS=1` on the pinned TensorFlow, and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` to be set before Python starts. Resume restores
+the logical data position by deterministic replay/skip, which can be slow on a
+long run. The official geometric augmentation can itself make strict mode stop
+on a nondeterministic CUDA backward operation; disabling it would no longer be
+the canonical recipe.
 
 ## What does this code do?
 Aside from the **NCSN++** and **DDPM++** models in our paper, this codebase also re-implements many previous score-based models in one place, including **NCSN** from [Generative Modeling by Estimating Gradients of the Data Distribution](https://arxiv.org/abs/1907.05600), **NCSNv2** from [Improved Techniques for Training Score-Based Generative Models](https://arxiv.org/abs/2006.09011), and **DDPM** from [Denoising Diffusion Probabilistic Models](https://arxiv.org/abs/2006.11239). 

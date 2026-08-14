@@ -5,6 +5,7 @@ __pycache__
 .cache
 .tfds
 .torch_extensions
+third_party/edm
 .miniforge3
 .conda*
 results

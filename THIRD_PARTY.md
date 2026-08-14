@@ -13,6 +13,11 @@ The source is installed into the ignored `third_party/edm/` directory by
 this Apache-licensed repository. The adapter is implemented in
 `models/edm_canonical.py`.
 
+The Docker build runs the same installer and therefore includes that pinned
+checkout in the resulting image under its original license. A runtime bind
+mount of the repository hides the image copy at that path, so the host checkout
+must also contain the pinned `third_party/edm/` directory.
+
 The official license restricts use to non-commercial purposes and imposes
 attribution/share-alike conditions. Consult the installed `LICENSE.txt` for
 the complete terms.

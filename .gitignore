@@ -24,12 +24,11 @@ __pycache__
 .DS_Store
 
 tmp*
-tests*
-
-*run*
-*eval*
 *.npz
 workdirs/*
+runs/
+eval/
+eval_*/
 
 # Official NVLabs EDM is installed separately because it is CC BY-NC-SA 4.0.
 third_party/edm/
