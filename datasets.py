@@ -292,7 +292,11 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
         ])
         img = (tf.random.stateless_uniform(
           tf.shape(img), seed=dequant_seed, dtype=tf.float32) + img * 255.) / 256.
-      return dict(image=img, label=None)
+      # No 'label' key: these TFRecords carry no label, and a Python None
+      # value in a tf.data structure becomes a NoneTensor placeholder that
+      # `.as_numpy_iterator()` (and anything else that materializes the full
+      # structure) refuses to handle. Nothing downstream reads batch['label'].
+      return dict(image=img)
 
   else:
     def preprocess_fn(d, is_training, example_index, dataset_seed):
@@ -315,7 +319,13 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
         img = (tf.random.stateless_uniform(
           tf.shape(img), seed=dequant_seed, dtype=tf.float32) + img * 255.) / 256.
 
-      return dict(image=img, label=d.get('label', None))
+      # Only attach 'label' when the underlying TFDS builder actually has
+      # one (e.g. CIFAR10/SVHN); CELEBA/LSUN don't. A Python None value here
+      # would become a NoneTensor placeholder that `.as_numpy_iterator()`
+      # refuses to handle, and nothing downstream reads batch['label'].
+      if 'label' in d:
+        return dict(image=img, label=d['label'])
+      return dict(image=img)
 
   def create_dataset(dataset_builder, split, is_training):
     dataset_seed = derive_seed(config.seed, 'tf-data', split,
