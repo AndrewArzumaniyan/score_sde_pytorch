@@ -343,6 +343,9 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
       image_paths = get_local_celeba_split_paths(split, config)
       if image_paths is None:
         raise FileNotFoundError('Local CelebA directory was expected but not found.')
+      take = getattr(config.data, f'celeba_{split}_take', -1)
+      if take >= 0:
+        image_paths = image_paths[:take]
       ds = tf.data.Dataset.from_tensor_slices(image_paths)
 
       def load_local_celeba_example(path):

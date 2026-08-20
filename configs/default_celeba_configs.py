@@ -47,6 +47,12 @@ def get_default_configs():
   config.data = data = ml_collections.ConfigDict()
   data.dataset = 'CELEBA'
   data.celeba_dir = 'celeba'
+  # Deterministic prefix-of-the-split subset for smoke/overfit probes; -1 (the
+  # default) means the full split. CelebA has no class labels to balance a
+  # subset by, unlike the CIFAR-10 per-class knobs, so this just takes the
+  # first N paths from list_eval_partition.txt for that split.
+  data.celeba_train_take = -1
+  data.celeba_validation_take = -1
   data.image_size = 64
   data.random_flip = True
   data.uniform_dequantization = False
