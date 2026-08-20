@@ -349,7 +349,10 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
         image = tf.io.read_file(path)
         image = tf.image.decode_jpeg(image, channels=3)
         image.set_shape([218, 178, 3])
-        return dict(image=image, label=None)
+        # No 'label' key: local CelebA has none, and a present-but-None
+        # value would still trip `preprocess_fn`'s `if 'label' in d:` check
+        # below (key presence, not value) into re-emitting a NoneTensor.
+        return dict(image=image)
 
       ds = ds.with_options(dataset_options)
       ds = ds.map(load_local_celeba_example, num_parallel_calls=tf.data.experimental.AUTOTUNE)
