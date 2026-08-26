@@ -30,7 +30,7 @@ if [[ $# -gt 0 ]]; then
   MODELS=("$@")
 else
   MODELS=(
-    vp cosine_vp edm edm_canonical fox_gaussian fox_matern32
+    vp ve cosine_vp edm edm_canonical fox_gaussian fox_matern32
     fox_matern32_vpdrift
   )
 fi
@@ -47,6 +47,7 @@ trap cleanup EXIT
 config_for_model() {
   case "$1" in
     vp) echo configs/vp/afhqv2_ncsnpp_continuous.py ;;
+    ve) echo configs/ve/afhqv2_ncsnpp_continuous.py ;;
     cosine_vp) echo configs/vp/afhqv2_ncsnpp_cosine_continuous.py ;;
     edm) echo configs/edm/afhqv2_ncsnpp.py ;;
     edm_canonical) echo configs/edm/afhqv2_canonical.py ;;

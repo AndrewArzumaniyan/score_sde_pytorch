@@ -3,7 +3,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 {vp|cosine_vp|edm|edm_canonical|fox_gaussian|fox_matern32|fox_matern32_vpdrift} [checkpoint] [config overrides...]" >&2
+  echo "Usage: $0 {vp|ve|cosine_vp|edm|edm_canonical|fox_gaussian|fox_matern32|fox_matern32_vpdrift} [checkpoint] [config overrides...]" >&2
   exit 1
 fi
 
@@ -26,6 +26,7 @@ mkdir -p "${TFDS_DATA_DIR}" "${TORCH_EXTENSIONS_DIR}" "${XDG_CACHE_HOME}" workdi
 
 case "${MODEL}" in
   vp)            CONFIG=configs/vp/afhqv2_ncsnpp_continuous.py ;;
+  ve)            CONFIG=configs/ve/afhqv2_ncsnpp_continuous.py ;;
   cosine_vp)     CONFIG=configs/vp/afhqv2_ncsnpp_cosine_continuous.py ;;
   edm)           CONFIG=configs/edm/afhqv2_ncsnpp.py ;;
   edm_canonical) CONFIG=configs/edm/afhqv2_canonical.py ;;

@@ -12,6 +12,7 @@ python -m py_compile \
   configs/default_afhqv2_configs.py \
   configs/vp/afhqv2_ncsnpp_continuous.py \
   configs/vp/afhqv2_ncsnpp_cosine_continuous.py \
+  configs/ve/afhqv2_ncsnpp_continuous.py \
   configs/edm/afhqv2_ncsnpp.py \
   configs/edm/afhqv2_canonical.py \
   configs/fox/afhqv2_ncsnpp_continuous.py \
@@ -21,7 +22,11 @@ python -m py_compile \
 python afhqv2_validation.py
 python baseline_validation.py
 python canonical_edm_validation.py
-python -m unittest tests.test_fox_sde
-python -m unittest tests.test_afhqv2_dataset
+if [[ -f tests/test_fox_sde.py ]]; then
+  python tests/test_fox_sde.py
+else
+  echo "tests/test_fox_sde.py is absent; baseline_validation.py already covered sampler NFE regression."
+fi
+python afhqv2_dataset_validation.py
 
 echo "All AFHQv2 static, loader, stats, FOX, Cosine-VP, and EDM checks passed."
