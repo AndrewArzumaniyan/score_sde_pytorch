@@ -125,7 +125,7 @@ so training and reference-stat computation cannot silently use different
 resize implementations. Set `AFHQV2_DIR` to move the prepared directory;
 otherwise `datasets/afhqv2-64x64` is used.
 
-Matching configs are provided for VP, Cosine-VP, controlled EDM, canonical
+Matching configs are provided for VP, VE, Cosine-VP, controlled EDM, canonical
 EDM, Gaussian FOX, Matern-3/2 FOX, and the current Matern-3/2 candidate with
 VP-linear drift and kappa 1000. The common launchers select them by
 name and keep the image budget, seed, workdir layout, checkpoints, logs, and
@@ -134,6 +134,7 @@ evaluation artifacts consistent:
 ```sh
 # Default pilot budget: approximately 6.4M training images, seed 42.
 ./run_afhqv2_train.sh cosine_vp
+./run_afhqv2_train.sh ve
 ./run_afhqv2_train.sh edm_canonical
 ./run_afhqv2_train.sh fox_matern32_vpdrift
 

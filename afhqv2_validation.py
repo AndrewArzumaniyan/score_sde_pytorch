@@ -7,6 +7,7 @@ from configs.edm.afhqv2_ncsnpp import get_config as get_controlled_edm
 from configs.fox.afhqv2_ncsnpp_continuous import get_config as get_fox
 from configs.fox.afhqv2_ncsnpp_continuous_matern_3_2 import get_config as get_matern
 from configs.fox.afhqv2_ncsnpp_continuous_matern_3_2_vp_drift import get_config as get_vp_drift_matern
+from configs.ve.afhqv2_ncsnpp_continuous import get_config as get_ve
 from configs.vp.afhqv2_ncsnpp_continuous import get_config as get_vp
 from configs.vp.afhqv2_ncsnpp_cosine_continuous import get_config as get_cosine_vp
 
@@ -15,7 +16,7 @@ class AFHQv2ConfigValidationTest(unittest.TestCase):
 
   def test_all_variants_share_the_same_data_contract(self):
     configs = [
-      get_vp(), get_cosine_vp(), get_controlled_edm(), get_canonical_edm(),
+      get_vp(), get_ve(), get_cosine_vp(), get_controlled_edm(), get_canonical_edm(),
       get_fox(), get_matern(), get_vp_drift_matern(),
     ]
     for config in configs:
@@ -29,6 +30,13 @@ class AFHQv2ConfigValidationTest(unittest.TestCase):
 
   def test_method_specific_schedules_are_selected(self):
     self.assertEqual(get_vp().training.sde, 'vpsde')
+    ve = get_ve()
+    self.assertEqual(ve.training.sde, 'vesde')
+    self.assertEqual(ve.model.sigma_min, 0.01)
+    self.assertEqual(ve.model.sigma_max, 90.0)
+    self.assertEqual(ve.sampling.predictor, 'reverse_diffusion')
+    self.assertEqual(ve.sampling.corrector, 'langevin')
+    self.assertEqual(ve.sampling.snr, 0.17)
     cosine = get_cosine_vp()
     self.assertEqual(cosine.training.sde, 'cosinevpsde')
     self.assertEqual(cosine.model.cosine_s, 0.008)
