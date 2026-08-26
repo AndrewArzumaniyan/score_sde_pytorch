@@ -109,6 +109,69 @@ protocol. The 18-step Heun sampler uses
 The official source is not vendored because its CC BY-NC-SA 4.0 license differs
 from this repository's Apache license; see `THIRD_PARTY.md`.
 
+### AFHQv2-64 experiments
+
+AFHQv2 is integrated as an unconditional 64x64 filesystem dataset. Download
+the updated `afhq-v2-dataset`, then convert the complete tree (train and test
+subdirectories together) with the pinned official EDM converter:
+
+```sh
+tools/prepare_afhqv2_64.sh /path/to/afhq-v2-dataset
+```
+
+The prepared directory contains 15,803 uncompressed PNG files and
+`dataset.json`. The loader deliberately accepts only this exact 64x64 format,
+so training and reference-stat computation cannot silently use different
+resize implementations. Set `AFHQV2_DIR` to move the prepared directory;
+otherwise `datasets/afhqv2-64x64` is used.
+
+Matching configs are provided for VP, Cosine-VP, controlled EDM, canonical
+EDM, Gaussian FOX, Matern-3/2 FOX, and the current Matern-3/2 candidate with
+VP-linear drift and kappa 1000. The common launchers select them by
+name and keep the image budget, seed, workdir layout, checkpoints, logs, and
+evaluation artifacts consistent:
+
+```sh
+# Default pilot budget: approximately 6.4M training images, seed 42.
+./run_afhqv2_train.sh cosine_vp
+./run_afhqv2_train.sh edm_canonical
+./run_afhqv2_train.sh fox_matern32_vpdrift
+
+# Common 50k-sample IS/FID/KID evaluation of the fourth checkpoint.
+./run_afhqv2_eval_50k.sh cosine_vp 4
+./run_afhqv2_eval_50k.sh edm_canonical 4
+./run_afhqv2_eval_50k.sh fox_matern32_vpdrift 4
+```
+
+Use `TARGET_KIMG`, `SEED`, or `WORKDIR` to define an equal-budget comparison
+run. The canonical config itself defaults to the exact published 200M-image
+budget (`n_iters=781249` because this loop performs `n_iters + 1` updates).
+It follows the official AFHQv2 recipe: unconditional DDPM++, total batch 256,
+channel multipliers
+`1,2,2,2`, learning rate `2e-4`, dropout `0.25`, augmentation probability
+`0.15`, and deterministic 40-step Heun sampling (79 NFE). The launcher uses
+four 64-image microbatches to realize that total batch. Other methods keep
+their native samplers; report NFE beside FID and run a separate
+`eval.sampling_num_scales` ablation for an NFE-matched claim.
+
+The first evaluation computes and caches reference `pool_3` features over all
+15,803 prepared images. The cache filename is tied to a dataset fingerprint.
+Generated samples from every method are scored by the same repository
+TF-GAN/TFHub pipeline; this is the cross-method comparison metric, distinct
+from NVLabs' standalone `fid.py` implementation.
+
+Before allocating a long server run, execute the in-container checks and then
+the two-step GPU smoke for every AFHQv2 method:
+
+```sh
+./run_afhqv2_validation.sh
+./run_afhqv2_smoke.sh
+```
+
+The validation suite creates its own synthetic PNG fixture and does not need
+the real dataset. The GPU smoke requires the prepared AFHQv2 directory, writes
+only temporary checkpoints under `/tmp`, and removes them after each method.
+
 ### Reproducibility and artifact identity
 
 `config.seed` is applied to Python, NumPy, PyTorch, TensorFlow, TFDS shuffle,

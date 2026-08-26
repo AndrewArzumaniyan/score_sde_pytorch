@@ -74,3 +74,25 @@ def apply_canonical_edm_defaults(config):
   config.eval.end_ckpt = 15
   config.eval.batch_size = 64
   return config
+
+
+def apply_canonical_edm_afhqv2_defaults(config):
+  """Official unconditional AFHQv2-64 EDM recipe from Karras et al."""
+  config = apply_canonical_edm_defaults(config)
+  # Official config: --batch=256 --cres=1,2,2,2 --lr=2e-4
+  # --dropout=0.25 --augment=0.15. A physical batch of 64 accumulated four
+  # times preserves the exact total batch and all image-count schedules.
+  config.training.batch_size = 64
+  config.training.effective_batch_size = 256
+  config.training.gradient_accumulation_steps = 4
+  # run_lib performs n_iters + 1 steps: 781250 * 256 = 200M images.
+  config.training.n_iters = 781249
+  config.training.edm_augment_probability = 0.15
+
+  config.model.edm_channel_mult = (1, 2, 2, 2)
+  config.model.dropout = 0.25
+  config.optim.lr = 2e-4
+
+  # Official deterministic AFHQv2-64 sampler: 40 steps / 79 NFE.
+  config.sampling.edm_num_steps = 40
+  return config

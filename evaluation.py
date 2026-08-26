@@ -86,6 +86,10 @@ def _get_stats_filename(config):
     else:
       source_hash = hashlib.sha256(b'tfds').hexdigest()[:12]
     return f'assets/stats/celeba_{resolution}_{source_hash}_stats.npz'
+  elif config.data.dataset == 'AFHQV2':
+    resolution = config.data.image_size
+    identity = datasets_lib.afhqv2_dataset_identity(config)[:12]
+    return f'assets/stats/afhqv2_{resolution}_{identity}_stats.npz'
   elif config.data.dataset == 'LSUN':
     return f'assets/stats/lsun_{config.data.category}_{config.data.image_size}_stats.npz'
   else:
@@ -183,11 +187,61 @@ def _compute_celeba_stats(filename, inception_model, batch_size, config):
     logging.info('Dataset stats were published concurrently: %s', filename)
 
 
+def _load_afhqv2_image(path, resolution):
+  """Load an official-converter AFHQv2 PNG for Inception evaluation."""
+  image = tf.io.read_file(path)
+  image = tf.image.decode_png(image, channels=3)
+  expected = tf.constant([resolution, resolution, 3], dtype=tf.int32)
+  with tf.control_dependencies([
+      tf.debugging.assert_equal(
+        tf.shape(image), expected,
+        message='AFHQv2 reference images must have the configured resolution')]):
+    image = tf.image.convert_image_dtype(tf.identity(image), tf.float32)
+  return image * 255.
+
+
+def _compute_afhqv2_stats(filename, inception_model, batch_size, config):
+  """Compute pool_3 stats over the complete prepared AFHQv2 dataset."""
+  resolution = config.data.image_size
+  image_paths = datasets_lib.get_local_afhqv2_paths(config)
+  if image_paths is None:
+    raise FileNotFoundError(
+      'Prepared AFHQv2-64 was not found. Run tools/prepare_afhqv2_64.sh.')
+  identity = datasets_lib.afhqv2_dataset_identity(config)
+  logging.info('Computing AFHQv2 stats from %s (%d images)',
+               datasets_lib.get_local_afhqv2_root(config), len(image_paths))
+  ds = tf.data.Dataset.from_tensor_slices(image_paths)
+  ds = ds.map(lambda path: _load_afhqv2_image(path, resolution),
+              num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  ds = ds.batch(batch_size)
+  ds = ds.prefetch(tf.data.experimental.AUTOTUNE)
+
+  pools = []
+  total = 0
+  for batch in ds:
+    gc.collect()
+    latents = run_inception_distributed(batch, inception_model)
+    gc.collect()
+    pools.append(latents['pool_3'].numpy())
+    total += int(batch.shape[0])
+    logging.info('Computed AFHQv2 dataset stats for %d examples', total)
+
+  pool_3 = np.concatenate(pools, axis=0)
+  try:
+    atomic_savez(
+      filename, overwrite=False, pool_3=pool_3,
+      resolution=np.asarray(resolution),
+      num_examples=np.asarray(pool_3.shape[0]),
+      dataset_identity=np.asarray(identity))
+  except FileExistsError:
+    logging.info('Dataset stats were published concurrently: %s', filename)
+
+
 def load_dataset_stats(config, inception_model=None):
   """Load pre-computed dataset statistics, computing them for supported TFDS datasets if needed."""
   filename = _get_stats_filename(config)
   if not tf.io.gfile.exists(filename):
-    logging.info('Dataset stats file %s not found. Computing it from TFDS.', filename)
+    logging.info('Dataset stats file %s not found. Computing it.', filename)
     if inception_model is None:
       inception_model = get_inception_model()
     batch_size = getattr(getattr(config, 'eval', None), 'batch_size', 512)
@@ -200,6 +254,8 @@ def load_dataset_stats(config, inception_model=None):
         split=getattr(config.data, 'cifar10_stats_split', 'train'))
     elif config.data.dataset == 'CELEBA':
       _compute_celeba_stats(filename, inception_model, batch_size, config)
+    elif config.data.dataset == 'AFHQV2':
+      _compute_afhqv2_stats(filename, inception_model, batch_size, config)
     else:
       raise FileNotFoundError(
         f'Dataset stats file {filename} does not exist. '

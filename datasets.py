@@ -15,6 +15,7 @@
 
 # pylint: skip-file
 """Return training and evaluation/test datasets from config files."""
+import hashlib
 import os
 
 import tensorflow as tf
@@ -33,6 +34,8 @@ _CELEBA_PARTITIONS = {
   'validation': '1',
   'test': '2',
 }
+
+_AFHQV2_IMAGE_EXTENSION = '.png'
 
 
 def _normalize_local_celeba_root(path):
@@ -107,6 +110,84 @@ def get_local_celeba_split_paths(split, config=None):
       if partition == partition_id:
         image_paths.append(os.path.join(image_dir, filename))
   return image_paths
+
+
+def _normalize_afhqv2_root(path):
+  """Locate an extracted 64x64 directory produced by EDM dataset_tool.py."""
+  if not path:
+    return None
+  candidates = [
+    path,
+    os.path.join(path, 'afhqv2-64x64'),
+    os.path.join(path, 'afhqv2_64'),
+  ]
+  for candidate in candidates:
+    if not os.path.isdir(candidate):
+      continue
+    # dataset.json is the format marker written by the official EDM converter.
+    if not os.path.isfile(os.path.join(candidate, 'dataset.json')):
+      continue
+    for _root, _dirs, files in os.walk(candidate):
+      if any(name.lower().endswith(_AFHQV2_IMAGE_EXTENSION) for name in files):
+        return os.path.realpath(candidate)
+  return None
+
+
+def get_local_afhqv2_root(config=None):
+  """Return the prepared AFHQv2-64 root, or None when it is unavailable."""
+  candidates = []
+  if config is not None:
+    configured = getattr(getattr(config, 'data', None), 'afhqv2_dir', None)
+    if configured:
+      candidates.append(configured)
+  environment_root = os.environ.get('AFHQV2_DIR')
+  if environment_root:
+    candidates.append(environment_root)
+  repo_root = os.path.dirname(os.path.abspath(__file__))
+  cwd = os.getcwd()
+  candidates.extend([
+    os.path.join(cwd, 'datasets', 'afhqv2-64x64'),
+    os.path.join(repo_root, 'datasets', 'afhqv2-64x64'),
+  ])
+  for candidate in candidates:
+    normalized = _normalize_afhqv2_root(candidate)
+    if normalized is not None:
+      return normalized
+  return None
+
+
+def get_local_afhqv2_paths(config=None):
+  """Return the official-converter PNGs in stable lexicographic order."""
+  root = get_local_afhqv2_root(config)
+  if root is None:
+    return None
+  paths = []
+  for current_root, directories, files in os.walk(root):
+    directories.sort()
+    for filename in sorted(files):
+      if filename.lower().endswith(_AFHQV2_IMAGE_EXTENSION):
+        paths.append(os.path.join(current_root, filename))
+  if not paths:
+    raise FileNotFoundError(f'No AFHQv2 PNG images found under {root}.')
+  return paths
+
+
+def afhqv2_dataset_identity(config=None):
+  """Fingerprint the prepared dataset layout for reference-stat provenance."""
+  root = get_local_afhqv2_root(config)
+  paths = get_local_afhqv2_paths(config)
+  if root is None or paths is None:
+    raise FileNotFoundError(
+      'Prepared AFHQv2-64 was not found. Run tools/prepare_afhqv2_64.sh.')
+  digest = hashlib.sha256(os.path.realpath(root).encode('utf-8'))
+  metadata_path = os.path.join(root, 'dataset.json')
+  with open(metadata_path, 'rb') as metadata_file:
+    digest.update(metadata_file.read())
+  for path in paths:
+    relative = os.path.relpath(path, root).replace(os.sep, '/')
+    digest.update(relative.encode('utf-8'))
+    digest.update(str(os.path.getsize(path)).encode('ascii'))
+  return digest.hexdigest()
 
 
 def get_data_scaler(config):
@@ -240,6 +321,27 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
       img = resize_small(img, config.data.image_size)
       return img
 
+  elif config.data.dataset == 'AFHQV2':
+    local_afhqv2_root = get_local_afhqv2_root(config)
+    if local_afhqv2_root is None:
+      raise FileNotFoundError(
+        'Prepared AFHQv2-64 was not found. Run '
+        '`tools/prepare_afhqv2_64.sh SOURCE_DIR` or set AFHQV2_DIR.')
+    dataset_builder = local_afhqv2_root
+    train_split_name = eval_split_name = 'all'
+
+    def resize_op(img):
+      # Images are pre-resized by the official EDM converter. Refuse to apply
+      # another library's resize kernel silently.
+      expected = tf.constant(
+        [config.data.image_size, config.data.image_size, config.data.num_channels],
+        dtype=tf.int32)
+      with tf.control_dependencies([
+          tf.debugging.assert_equal(
+            tf.shape(img), expected,
+            message='AFHQv2 images must match the prepared 64x64 resolution')]):
+        return tf.image.convert_image_dtype(tf.identity(img), tf.float32)
+
   elif config.data.dataset == 'LSUN':
     dataset_builder = tfds.builder(f'lsun/{config.data.category}', data_dir=tfds_data_dir)
     train_split_name = 'train'
@@ -359,6 +461,28 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
 
       ds = ds.with_options(dataset_options)
       ds = ds.map(load_local_celeba_example, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    elif config.data.dataset == 'AFHQV2' and isinstance(dataset_builder, str):
+      image_paths = get_local_afhqv2_paths(config)
+      if image_paths is None:
+        raise FileNotFoundError('Prepared AFHQv2-64 directory was expected but not found.')
+      take_name = 'afhqv2_train_take' if is_training else 'afhqv2_eval_take'
+      take = getattr(config.data, take_name, -1)
+      if take >= 0:
+        image_paths = image_paths[:take]
+      ds = tf.data.Dataset.from_tensor_slices(image_paths)
+
+      def load_local_afhqv2_example(path):
+        image = tf.io.read_file(path)
+        image = tf.image.decode_png(image, channels=3)
+        image.set_shape([
+          config.data.image_size, config.data.image_size,
+          config.data.num_channels])
+        return dict(image=image)
+
+      ds = ds.with_options(dataset_options)
+      ds = ds.map(
+        load_local_afhqv2_example,
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
     elif isinstance(dataset_builder, tfds.core.DatasetBuilder):
       dataset_builder.download_and_prepare()
       ds = dataset_builder.as_dataset(
