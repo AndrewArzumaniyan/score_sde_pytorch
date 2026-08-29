@@ -25,6 +25,8 @@ def get_default_configs():
   sampling.noise_removal = True
   sampling.probability_flow = False
   sampling.snr = 0.16
+  # FoxVPSDE sampling grid: 'uniform_time' | 'uniform_logsnr' | 'uniform_variance'.
+  # 'uniform_variance' is only valid when q(t) is monotone (not for vp_linear).
   sampling.time_grid = 'uniform_time'
 
   # evaluation

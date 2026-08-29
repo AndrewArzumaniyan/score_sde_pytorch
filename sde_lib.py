@@ -505,6 +505,57 @@ class FoxVPSDE(SDE):
     _, _, _, _, variance = self._cached_schedule(t)
     return torch.clamp(self._interpolate(t, variance), min=0.0)
 
+  def log_snr(self, t):
+    """log-SNR lambda(t) = 2 log alpha(t) - log q(t).
+
+    lambda'(t) = -2 D_eff(t) / q(t), so lambda is strictly decreasing on (0, T]
+    whenever D_eff(t) > 0 -- even when the marginal variance q(t) itself is
+    non-monotone (e.g. drift_schedule='vp_linear').  This makes log-SNR the
+    robust monotone coordinate for building sampling grids.
+    """
+    _, _, log_mean_coeff, _, variance = self._cached_schedule(t)
+    log_var = torch.log(torch.clamp(self._interpolate(t, variance), min=1e-30))
+    return 2.0 * self._interpolate(t, log_mean_coeff) - log_var
+
+  def _uniform_logsnr_grid(self, eps, num_steps, device, dtype):
+    """Reverse-time grid (T -> eps) with uniformly spaced log-SNR.
+
+    Well defined whenever log-SNR is monotone, i.e. D_eff(t) > 0 on (0, T].
+    This is the case 'uniform_variance' cannot handle: for a non-monotone q(t)
+    a searchsorted on the variance table is mathematically invalid.
+
+    Inversion is by vectorized bisection against ``log_snr`` (monotone), so the
+    grid is exact w.r.t. the model's own piecewise-linear schedule and does not
+    depend on ``schedule_grid_size`` resolution.
+    """
+    log_mean_coeff = self._log_mean_coeff_cpu.to(device=device, dtype=dtype)
+    variance = self._variance_cpu.to(device=device, dtype=dtype)
+    interior = variance > 0
+    lam_grid = 2.0 * log_mean_coeff[interior] - torch.log(variance[interior])
+    if not bool(torch.all(lam_grid[1:] < lam_grid[:-1])):
+      raise ValueError(
+        "uniform_logsnr needs a strictly decreasing log-SNR on (0, T] "
+        "(D_eff(t) > 0 everywhere); this schedule violates that. Use uniform_time.")
+
+    eps_t = torch.tensor(float(eps), device=device, dtype=dtype)
+    T_t = torch.tensor(float(self.T), device=device, dtype=dtype)
+    lam_eps = self.log_snr(eps_t.reshape(1))[0]
+    lam_T = self.log_snr(T_t.reshape(1))[0]
+    targets = torch.linspace(lam_T.item(), lam_eps.item(), num_steps,
+                             device=device, dtype=dtype)
+
+    lo = torch.full_like(targets, float(eps))
+    hi = torch.full_like(targets, float(self.T))
+    for _ in range(64):
+      mid = 0.5 * (lo + hi)
+      too_small = self.log_snr(mid) > targets     # lam decreasing -> t below target
+      lo = torch.where(too_small, mid, lo)
+      hi = torch.where(too_small, hi, mid)
+    timesteps = 0.5 * (lo + hi)
+    timesteps[0] = T_t
+    timesteps[-1] = eps_t
+    return timesteps
+
   def sampling_time_grid(self, eps, grid='uniform_time', device=None, dtype=None, N=None):
     """Build reverse-time sampling grids for Fox-aware discretization."""
     num_steps = self.N if N is None else N
@@ -515,8 +566,12 @@ class FoxVPSDE(SDE):
 
     if grid == 'uniform_time':
       return torch.linspace(self.T, eps, num_steps, device=device, dtype=dtype)
+    if grid == 'uniform_logsnr':
+      return self._uniform_logsnr_grid(eps, num_steps, device, dtype)
     if grid != 'uniform_variance':
-      raise ValueError(f'Unsupported Fox sampling grid: {grid}')
+      raise ValueError(
+        "Unsupported Fox sampling grid: %r (expected 'uniform_time', "
+        "'uniform_logsnr' or 'uniform_variance')" % (grid,))
 
     schedule_times = self._schedule_times_cpu.to(device=device, dtype=dtype)
     variance = self._variance_cpu.to(device=device, dtype=dtype)
