@@ -46,9 +46,18 @@ def get_config():
   model.conv_size = 3
 
   model.fox_u = -5.0
-  # Set to 'vp_linear' to use k(t) = -beta(t)/2 instead of the constant u.
-  # Keeping this default preserves compatibility with existing FOX checkpoints.
+  # Fox drift schedule: 'constant' (k(t) = fox_u), 'vp_linear' (k(t) = -beta(t)/2),
+  # or 'affine' (k_a(t) = fox_drift_k_bar + fox_drift_a (t - 1/2)).
+  # Keeping 'constant' preserves compatibility with existing FOX checkpoints.
   model.fox_drift_schedule = 'constant'
+  # Affine-drift parameters (used iff fox_drift_schedule == 'affine').
+  # int_0^1 k_a = fox_drift_k_bar for any fox_drift_a; -5.025 matches the
+  # vp_linear / constant u=-5 terminal contraction.
+  model.fox_drift_k_bar = -5.025
+  model.fox_drift_a = 0.0
+  # normalize_scale: keep the induced log-SNR path but rescale to alpha^2 + q = 1
+  # (VP-type overall scale).  Used for the E4 'normalized-FOX' arm.
+  model.fox_normalize_scale = False
   model.fox_beta_min = model.beta_min
   model.fox_beta_max = model.beta_max
   model.fox_diffusion_scale = 1.0

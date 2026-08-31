@@ -318,6 +318,9 @@ class FoxVPSDE(SDE):
                power_law_alpha=1.5,
                power_law_tau0=0.2,
                matern_length_scale=0.3,
+               drift_k_bar=-5.025,
+               drift_a=0.0,
+               normalize_scale=False,
                schedule_grid_size=4096,
                target_terminal_variance=None,
                N=1000):
@@ -335,7 +338,21 @@ class FoxVPSDE(SDE):
     self.power_law_alpha = float(power_law_alpha)
     self.power_law_tau0 = float(power_law_tau0)
     self.matern_length_scale = float(matern_length_scale)
+    # Affine drift k_a(t) = drift_k_bar + drift_a (t - 1/2).  int_0^1 k_a =
+    # drift_k_bar for any drift_a, so the terminal alpha(1) / lambda(1) are
+    # pinned while drift_a only redistributes contraction along the path.
+    # Used iff drift_schedule == 'affine'.
+    self.drift_k_bar = float(drift_k_bar)
+    self.drift_a = float(drift_a)
+    # normalize_scale: keep the induced log-SNR path lambda(t) but rescale the
+    # marginal to alpha^2 + q = 1 (VP-type overall scale r(t) == 1).
+    # Schedule-only post-processing; see _build_schedule_cache.
+    self.normalize_scale = bool(normalize_scale)
     self.schedule_grid_size = int(schedule_grid_size)
+    if self.normalize_scale and self.schedule_grid_size < 8192:
+      # normalize_scale recovers drift / D_eff by differentiating the schedule
+      # numerically, so keep the quadrature grid fine regardless of the request.
+      self.schedule_grid_size = 8192
     self.target_terminal_variance = target_terminal_variance
     self.N = N
 
@@ -375,14 +392,24 @@ class FoxVPSDE(SDE):
       raise ValueError('matern_length_scale must be positive.')
     if self.target_terminal_variance is not None and self.target_terminal_variance <= 0.0:
       raise ValueError('target_terminal_variance must be positive.')
-    if self.drift_schedule not in ('constant', 'vp_linear'):
+    if self.drift_schedule not in ('constant', 'vp_linear', 'affine'):
       raise ValueError('Unsupported Fox drift schedule: %s' % self.drift_schedule)
+    if self.drift_schedule == 'affine':
+      k_at_0 = self.drift_k_bar - 0.5 * self.drift_a
+      k_at_1 = self.drift_k_bar + 0.5 * self.drift_a
+      if k_at_0 >= 0.0 or k_at_1 >= 0.0:
+        raise ValueError(
+          'affine drift k_a(t) = k_bar + a (t - 1/2) must stay negative on '
+          '[0, 1]; got k_a(0) = %.4g, k_a(1) = %.4g (need |a| < 2|k_bar|).'
+          % (k_at_0, k_at_1))
     if self.beta_min <= 0.0 or self.beta_max <= 0.0:
       raise ValueError('Fox VP beta_min and beta_max must be positive.')
 
   def _drift_coefficient_np(self, t):
     if self.drift_schedule == 'constant':
       return np.full_like(t, self.u, dtype=np.float64)
+    if self.drift_schedule == 'affine':
+      return self.drift_k_bar + self.drift_a * (t - 0.5)
     beta_t = self.beta_min + t * (self.beta_max - self.beta_min)
     return -0.5 * beta_t
 
@@ -444,6 +471,31 @@ class FoxVPSDE(SDE):
 
     variance = np.maximum(variance, 0.0)
     effective_diffusion = np.maximum(effective_diffusion, 0.0)
+
+    if self.normalize_scale:
+      # 'normalized-FOX' (E4): keep the induced log-SNR path lambda(t) but force
+      # alpha^2 + q = 1, i.e. a VP-type overall scale r(t) == 1.  With
+      #   alpha_tilde^2 = sigmoid(lambda),   q_tilde = sigmoid(-lambda),
+      # the log-SNR lambda_tilde = log(alpha_tilde^2 / q_tilde) == lambda is
+      # unchanged by construction.  Drift and D_eff are then recovered from the
+      # moment ODEs by differentiating the analytic (alpha_tilde, q_tilde) on the
+      # schedule grid -- the same numeric-inversion route used for VP / cosine.
+      safe_variance = np.maximum(variance, 1e-300)
+      log_snr_grid = 2.0 * log_mean_coeff - np.log(safe_variance)
+      # index 0: q(0) = 0 => lambda(0) = +inf; use a finite placeholder, the
+      # true t = 0 limits are written back explicitly below and t = 0 is never
+      # used as the right interpolation node.
+      log_snr_grid[0] = 2.0 * log_snr_grid[1] - log_snr_grid[2]
+      log_alpha_tilde = -0.5 * np.logaddexp(0.0, -log_snr_grid)   # 0.5 log sigmoid(lambda)
+      q_tilde = np.exp(-np.logaddexp(0.0, log_snr_grid))          # sigmoid(-lambda)
+      log_alpha_tilde[0] = 0.0                                    # alpha_tilde(0) = 1
+      q_tilde[0] = 0.0                                            # q_tilde(0) = 0
+      drift_coefficient = np.gradient(log_alpha_tilde, times)     # d/dt log alpha_tilde
+      q_tilde_dot = np.gradient(q_tilde, times)
+      effective_diffusion = 0.5 * (q_tilde_dot - 2.0 * drift_coefficient * q_tilde)
+      log_mean_coeff = log_alpha_tilde
+      variance = np.maximum(q_tilde, 0.0)
+      effective_diffusion = np.maximum(effective_diffusion, 0.0)
 
     self._schedule_times_cpu = torch.from_numpy(times)
     self._drift_coefficient_cpu = torch.from_numpy(drift_coefficient)

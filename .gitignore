@@ -25,10 +25,12 @@ __pycache__
 
 tmp*
 *.npz
+*.log
 workdirs/*
 runs/
 eval/
 eval_*/
+server_audit_*/
 
 # Official NVLabs EDM is installed separately because it is CC BY-NC-SA 4.0.
 third_party/edm/
