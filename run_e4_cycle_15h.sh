@@ -30,7 +30,7 @@ LOG_DIR="${HERE}/run_e4_logs"
 mkdir -p "$LOG_DIR"
 ts() { date +%Y-%m-%dT%H:%M:%S; }
 
-echo "[$(ts)] E4 cycle start   GPU=${CUDA_VISIBLE_DEVICES}   phase2=${RUN_PHASE2}"
+echo "[$(ts)] E4 cycle start   GPU=${CUDA_VISIBLE_DEVICES:-pinned by docker --gpus}   phase2=${RUN_PHASE2}"
 echo "[$(ts)] arms: VP=${VP_WORKDIR}  realFOX=${REALFOX_WORKDIR}  normFOX=${NORMFOX_WORKDIR}"
 
 # --- Phase 1 --------------------------------------------------------------
