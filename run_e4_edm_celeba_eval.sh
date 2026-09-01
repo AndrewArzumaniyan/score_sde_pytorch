@@ -18,7 +18,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/run_e4_common.sh"
 tools/install_official_edm.sh
 
 NUM_SAMPLES="${1:-50000}"
+shift || true
 
+# NOTE: the EDM CelebA checkpoint was trained *after* afb5297 (2026-08-14), i.e.
+# with allow_tf32=False (true FP32).  We keep it at the config default here so the
+# eval matches its own training regime; only cudnn autotune (numerically neutral)
+# is enabled for throughput.
 echo "=== [E4] EDM CelebA eval -> ${EDM_WORKDIR} ckpt-${EDM_CKPT}, ${NUM_SAMPLES} samples ==="
 python -u main.py \
   --mode=eval \
@@ -32,5 +37,7 @@ python -u main.py \
   --config.eval.enable_sampling=True \
   --config.eval.enable_loss=False \
   --config.eval.enable_bpd=False \
-  --config.seed=42
+  --config.seed=42 \
+  --config.cudnn_benchmark="${E4_CUDNN_BENCHMARK}" \
+  "$@"
 echo "=== [E4] EDM CelebA eval done ==="

@@ -30,7 +30,24 @@ NORMFOX_WORKDIR="${NORMFOX_WORKDIR:-workdirs/celeba_fox_normalized_kappa1000_100
 EDM_WORKDIR="${EDM_WORKDIR:-workdirs/celeba_edm_canonical_50k}"
 EDM_CKPT="${EDM_CKPT:-4}"
 
-E4_CKPT="${E4_CKPT:-20}"                 # 100k / snapshot_freq 5000
+# Training length for the new normalized-FOX arm.  snapshot_freq is fixed at
+# 5000, so E4_CKPT (the checkpoint every arm is evaluated at) derives from it:
+#   E4_TRAIN_ITERS=100000 -> ckpt-20   (100k-matched with the existing VP / real-FOX numbers)
+#   E4_TRAIN_ITERS=50000  -> ckpt-10   (~half the wall-clock; VP / real-FOX have ckpt-10 too)
+E4_TRAIN_ITERS="${E4_TRAIN_ITERS:-100000}"
+E4_CKPT="${E4_CKPT:-$((E4_TRAIN_ITERS / 5000))}"
+
+# cuDNN conv autotuning: ~1.5x on H200 for this model; only picks among
+# mathematically-equivalent conv algorithms.  Override `-e E4_CUDNN_BENCHMARK=False`.
+E4_CUDNN_BENCHMARK="${E4_CUDNN_BENCHMARK:-True}"
+
+# TF32 conv/matmul.  Default True because the reference VP / real-FOX checkpoints
+# were trained BEFORE commit afb5297 (2026-08-14) added reproducibility.py, i.e.
+# with torch's default cuDNN TF32 ON.  So allow_tf32=True *matches* them (and is
+# ~3x faster on Hopper).  Set `-e E4_ALLOW_TF32=False` only if you have verified
+# the reference checkpoints are post-afb5297 (true FP32).
+E4_ALLOW_TF32="${E4_ALLOW_TF32:-True}"
+
 KAPPA1000_ELL="346.4101615138"          # |u|=5, kappa=1000, matern_3_2
 
 VP_CONFIG="configs/vp/celeba_ncsnpp_continuous.py"

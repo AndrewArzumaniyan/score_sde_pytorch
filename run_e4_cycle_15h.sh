@@ -19,7 +19,8 @@
 #   between arms; each arm's numbers are written when it finishes.
 #
 # Total if run straight through: ~15-25 h.  Set RUN_PHASE2=0 to stop after
-# Phase 1.  Everything is resumable (rerun this script).
+# Phase 1.  Everything is resumable (rerun this script).  Any `--config.*` args
+# given to this script are forwarded to every train / eval step.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,16 +33,17 @@ ts() { date +%Y-%m-%dT%H:%M:%S; }
 
 echo "[$(ts)] E4 cycle start   GPU=${CUDA_VISIBLE_DEVICES:-pinned by docker --gpus}   phase2=${RUN_PHASE2}"
 echo "[$(ts)] arms: VP=${VP_WORKDIR}  realFOX=${REALFOX_WORKDIR}  normFOX=${NORMFOX_WORKDIR}"
+echo "[$(ts)] iters=${E4_TRAIN_ITERS} ckpt=${E4_CKPT} cudnn_benchmark=${E4_CUDNN_BENCHMARK} allow_tf32=${E4_ALLOW_TF32} extra='$*'"
 
 # --- Phase 1 --------------------------------------------------------------
 echo "[$(ts)] 1/4  train normalized-FOX"
-bash "${HERE}/run_e4_normalized_fox_train.sh" 2>&1 | tee "${LOG_DIR}/1_train_normfox.log"
+bash "${HERE}/run_e4_normalized_fox_train.sh" "$@" 2>&1 | tee "${LOG_DIR}/1_train_normfox.log"
 
 echo "[$(ts)] 2/4  EDM CelebA eval (50k)"
-bash "${HERE}/run_e4_edm_celeba_eval.sh" 50000 2>&1 | tee "${LOG_DIR}/2_edm_eval.log"
+bash "${HERE}/run_e4_edm_celeba_eval.sh" 50000 "$@" 2>&1 | tee "${LOG_DIR}/2_edm_eval.log"
 
 echo "[$(ts)] 3/4  E4 eval @ 5k (all 3 arms)"
-bash "${HERE}/run_e4_eval.sh" 5000 5k 2>&1 | tee "${LOG_DIR}/3_eval_5k.log"
+bash "${HERE}/run_e4_eval.sh" 5000 5k "$@" 2>&1 | tee "${LOG_DIR}/3_eval_5k.log"
 
 echo "[$(ts)] ---- Phase 1 done.  Inspect eval_e4_5k/ before committing to Phase 2. ----"
 grep -hE "ckpt-.*(FID|inception)" "${LOG_DIR}"/*.log || true
@@ -49,7 +51,7 @@ grep -hE "ckpt-.*(FID|inception)" "${LOG_DIR}"/*.log || true
 # --- Phase 2 -------------------------------------------------------------
 if [[ "${RUN_PHASE2}" == "1" ]]; then
   echo "[$(ts)] 4/4  E4 eval @ 50k (all 3 arms) -- ~8-12 h, Ctrl-C-safe between arms"
-  bash "${HERE}/run_e4_eval.sh" 50000 50k 2>&1 | tee "${LOG_DIR}/4_eval_50k.log"
+  bash "${HERE}/run_e4_eval.sh" 50000 50k "$@" 2>&1 | tee "${LOG_DIR}/4_eval_50k.log"
 else
   echo "[$(ts)] RUN_PHASE2=0 -> stopping after Phase 1.  Later:  ${HERE}/run_e4_eval.sh 50000 50k"
 fi
