@@ -126,6 +126,17 @@ def get_model_fn(model, train=False):
   return model_fn
 
 
+def logsnr_to_label(log_snr, logsnr_min, logsnr_max):
+  """Map a common decreasing log-SNR interval to the legacy [0, 999] label."""
+  if logsnr_min is None or logsnr_max is None:
+    raise ValueError('Both log-SNR conditioning endpoints must be specified.')
+  if not float(logsnr_max) > float(logsnr_min):
+    raise ValueError('logsnr_max must be greater than logsnr_min.')
+  labels = ((float(logsnr_max) - log_snr) /
+            (float(logsnr_max) - float(logsnr_min))) * 999.0
+  return torch.clamp(labels, min=0.0, max=999.0)
+
+
 def get_score_fn(sde, model, train=False, continuous=False):
   """Wraps `score_fn` so that the model output corresponds to a real time-dependent score function.
 
@@ -147,7 +158,16 @@ def get_score_fn(sde, model, train=False, continuous=False):
         # For VP-trained models, t=0 corresponds to the lowest noise level
         # The maximum value of time embedding is assumed to 999 for
         # continuously-trained models.
-        labels = t * 999
+        conditioning = getattr(sde, 'noise_conditioning', 'time')
+        if conditioning == 'time':
+          labels = t * 999
+        elif conditioning == 'logsnr':
+          labels = logsnr_to_label(
+            sde.log_snr(t),
+            getattr(sde, 'conditioning_logsnr_min', None),
+            getattr(sde, 'conditioning_logsnr_max', None))
+        else:
+          raise ValueError(f'Unsupported noise conditioning {conditioning!r}.')
         score = model_fn(x, labels)
         std = sde.marginal_prob(torch.zeros_like(x), t)[1]
       else:

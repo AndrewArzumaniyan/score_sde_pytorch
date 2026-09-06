@@ -452,9 +452,24 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
   nfe = sde.N * (predictor_nfe + corrector_nfe)
 
   def get_time_grid():
-    if isinstance(sde, sde_lib.FoxVPSDE):
-      return sde.sampling_time_grid(eps, grid=time_grid, device=device, dtype=torch.float32, N=sde.N + 1)
-    return torch.linspace(sde.T, eps, sde.N + 1, device=device, dtype=torch.float32)
+    return sde.sampling_time_grid(
+      eps, grid=time_grid, device=device, dtype=torch.float32, N=sde.N + 1)
+
+  def get_initial_sample(timesteps):
+    x = sde.prior_sampling(shape).to(device)
+    lambda_min = getattr(sde, 'sampling_logsnr_min', None)
+    lambda_max = getattr(sde, 'sampling_logsnr_max', None)
+    if lambda_min is None and lambda_max is None:
+      return x
+    # A common finite terminal log-SNR generally starts before the native T.
+    # Use the Gaussian marginal's noise scale at that endpoint instead of the
+    # native prior scale.  As usual at low terminal SNR, the residual data mean
+    # is neglected by the Gaussian-prior approximation.
+    t0 = torch.full(
+      (shape[0],), timesteps[0].item(), device=device, dtype=x.dtype)
+    marginal_std = sde.marginal_prob(torch.zeros_like(x), t0)[1][0]
+    native_prior_std = float(getattr(sde, '_prior_std', 1.0))
+    return x * (marginal_std / native_prior_std)
 
   def pc_sampler(model):
     """ The PC sampler funciton.
@@ -466,8 +481,8 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
     """
     with torch.no_grad():
       # Initial sample
-      x = sde.prior_sampling(shape).to(device)
       timesteps = get_time_grid()
+      x = get_initial_sample(timesteps)
 
       for i in range(sde.N):
         t = timesteps[i]

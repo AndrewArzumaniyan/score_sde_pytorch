@@ -68,6 +68,86 @@ class SDE(abc.ABC):
     G = diffusion * torch.sqrt(torch.tensor(dt, device=t.device))
     return f, G
 
+  def log_snr(self, t):
+    """Return log(alpha(t)^2 / sigma(t)^2) for Gaussian marginals."""
+    raise NotImplementedError(
+      f'log-SNR is not implemented for {self.__class__.__name__}.')
+
+  def time_from_log_snr(self, log_snr, t_min=0.0, t_max=None):
+    """Invert a strictly decreasing log-SNR schedule by bisection."""
+    targets = torch.as_tensor(log_snr)
+    if not targets.is_floating_point():
+      targets = targets.to(torch.float32)
+    upper_time = float(self.T if t_max is None else t_max)
+    lower_time = float(t_min)
+    if not 0.0 <= lower_time < upper_time <= float(self.T):
+      raise ValueError(
+        f'Invalid inversion interval [{lower_time}, {upper_time}] for T={self.T}.')
+    lo = torch.full_like(targets, lower_time)
+    hi = torch.full_like(targets, upper_time)
+    lambda_lo = self.log_snr(lo)
+    lambda_hi = self.log_snr(hi)
+    # Schedule-backed SDEs accumulate quadrature/interpolation roundoff at the
+    # endpoints (about 2e-12 for normalized FOX at T).  Accept only a tiny
+    # numerical halo; genuinely out-of-range requests still fail loudly.
+    tolerance = max(64.0 * torch.finfo(targets.dtype).eps, 1e-10)
+    if bool(torch.any(targets > lambda_lo + tolerance)) or bool(
+        torch.any(targets < lambda_hi - tolerance)):
+      raise ValueError(
+        'Requested log-SNR lies outside the inversion interval: '
+        f'target=[{float(torch.min(targets)):.7g}, '
+        f'{float(torch.max(targets)):.7g}], available=['
+        f'{float(torch.min(lambda_hi)):.7g}, '
+        f'{float(torch.max(lambda_lo)):.7g}].')
+    for _ in range(64):
+      mid = 0.5 * (lo + hi)
+      too_early = self.log_snr(mid) > targets
+      lo = torch.where(too_early, mid, lo)
+      hi = torch.where(too_early, hi, mid)
+    return 0.5 * (lo + hi)
+
+  def sampling_time_grid(self, eps, grid='uniform_time', device=None,
+                         dtype=None, N=None):
+    """Build a reverse grid, optionally with explicit common log-SNR ends."""
+    num_points = self.N if N is None else int(N)
+    device = torch.device('cpu') if device is None else device
+    dtype = torch.float32 if dtype is None else dtype
+    lambda_min = getattr(self, 'sampling_logsnr_min', None)
+    lambda_max = getattr(self, 'sampling_logsnr_max', None)
+    if (lambda_min is None) != (lambda_max is None):
+      raise ValueError('Both sampling log-SNR endpoints must be set together.')
+
+    # Preserve the original sampler for SDEs that do not define log-SNR (VE,
+    # sub-VP) and for every pre-existing config without common endpoints.
+    if grid == 'uniform_time' and lambda_min is None:
+      return torch.linspace(float(self.T), float(eps), num_points,
+                            device=device, dtype=dtype)
+
+    if lambda_min is None:
+      start_time = torch.tensor(float(self.T), device=device, dtype=dtype)
+      end_time = torch.tensor(float(eps), device=device, dtype=dtype)
+      lambda_min_tensor = self.log_snr(start_time.reshape(1))[0]
+      lambda_max_tensor = self.log_snr(end_time.reshape(1))[0]
+    else:
+      lambda_min_tensor = torch.tensor(float(lambda_min), device=device, dtype=dtype)
+      lambda_max_tensor = torch.tensor(float(lambda_max), device=device, dtype=dtype)
+      start_time = self.time_from_log_snr(lambda_min_tensor.reshape(1))[0]
+      end_time = self.time_from_log_snr(lambda_max_tensor.reshape(1))[0]
+
+    if grid == 'uniform_time':
+      return torch.linspace(start_time.item(), end_time.item(), num_points,
+                            device=device, dtype=dtype)
+    if grid != 'uniform_logsnr':
+      raise ValueError(
+        f'Unsupported sampling grid {grid!r} for {self.__class__.__name__}.')
+    targets = torch.linspace(
+      lambda_min_tensor.item(), lambda_max_tensor.item(), num_points,
+      device=device, dtype=dtype)
+    times = self.time_from_log_snr(targets)
+    times[0] = start_time
+    times[-1] = end_time
+    return times
+
   def reverse(self, score_fn, probability_flow=False):
     """Create the reverse-time SDE/ODE.
 
@@ -143,6 +223,37 @@ class VPSDE(SDE):
     mean = torch.exp(log_mean_coeff[:, None, None, None]) * x
     std = torch.sqrt(1. - torch.exp(2. * log_mean_coeff))
     return mean, std
+
+  def log_snr(self, t):
+    log_alpha_squared = (
+      -0.5 * t ** 2 * (self.beta_1 - self.beta_0) - t * self.beta_0)
+    return log_alpha_squared - torch.log(
+      torch.clamp(-torch.expm1(log_alpha_squared), min=1e-30))
+
+  def time_from_log_snr(self, log_snr, t_min=0.0, t_max=None):
+    """Analytic inverse of the linear-beta VP log-SNR schedule."""
+    targets = torch.as_tensor(log_snr)
+    if not targets.is_floating_point():
+      targets = targets.to(torch.float32)
+    # alpha^2 = sigmoid(lambda), while
+    # -log(alpha^2) = beta_0 t + .5 (beta_1-beta_0) t^2.
+    integrated_beta = torch.nn.functional.softplus(-targets)
+    quadratic = 0.5 * (self.beta_1 - self.beta_0)
+    if abs(quadratic) < 1e-15:
+      times = integrated_beta / self.beta_0
+    else:
+      discriminant = self.beta_0 ** 2 + 4.0 * quadratic * integrated_beta
+      # Rationalized positive root avoids cancellation near clean data.
+      times = (2.0 * integrated_beta /
+               (self.beta_0 + torch.sqrt(discriminant)))
+    upper_time = float(self.T if t_max is None else t_max)
+    lower_time = float(t_min)
+    tolerance = max(64.0 * torch.finfo(targets.dtype).eps, 1e-10)
+    if bool(torch.any(times < lower_time - tolerance)) or bool(
+        torch.any(times > upper_time + tolerance)):
+      raise ValueError(
+        'Requested log-SNR lies outside the VP inversion interval.')
+    return torch.clamp(times, min=lower_time, max=upper_time)
 
   def prior_sampling(self, shape):
     return torch.randn(*shape)
@@ -233,6 +344,17 @@ class CosineVPSDE(VPSDE):
     mean = torch.sqrt(alpha_bar)[:, None, None, None] * x
     std = torch.sqrt(torch.clamp(1.0 - alpha_bar, min=0.0))
     return mean, std
+
+  def log_snr(self, t):
+    alpha_bar = self.alpha_bar(t)
+    return torch.log(torch.clamp(alpha_bar, min=1e-30)) - torch.log(
+      torch.clamp(1.0 - alpha_bar, min=1e-30))
+
+  def time_from_log_snr(self, log_snr, t_min=0.0, t_max=None):
+    # The linear-beta analytic inverse inherited from VPSDE does not apply to
+    # the cosine alpha-bar schedule.
+    return SDE.time_from_log_snr(
+      self, log_snr, t_min=t_min, t_max=t_max)
 
   def prior_sampling(self, shape):
     return torch.randn(*shape)
@@ -569,6 +691,40 @@ class FoxVPSDE(SDE):
     log_var = torch.log(torch.clamp(self._interpolate(t, variance), min=1e-30))
     return 2.0 * self._interpolate(t, log_mean_coeff) - log_var
 
+  def time_from_log_snr(self, log_snr, t_min=0.0, t_max=None):
+    """Invert FOX log-SNR using cached brackets plus local bisection."""
+    targets = torch.as_tensor(log_snr)
+    if not targets.is_floating_point():
+      targets = targets.to(torch.float32)
+    upper_time = float(self.T if t_max is None else t_max)
+    lower_time = float(t_min)
+    if lower_time != 0.0 or upper_time != float(self.T):
+      # The training/sampling paths use the full cached interval. Preserve the
+      # general API for callers requesting a custom subinterval.
+      return super().time_from_log_snr(
+        targets, t_min=lower_time, t_max=upper_time)
+
+    times, _, log_mean_coeff, _, variance = self._cached_schedule(targets)
+    log_snr_grid = (2.0 * log_mean_coeff -
+                    torch.log(torch.clamp(variance, min=1e-30)))
+    log_snr_grid[0] = torch.inf
+    tolerance = max(64.0 * torch.finfo(targets.dtype).eps, 1e-10)
+    if bool(torch.any(targets < log_snr_grid[-1] - tolerance)):
+      raise ValueError('Requested log-SNR lies below the FOX terminal value.')
+
+    indices = torch.searchsorted(-log_snr_grid, -targets)
+    indices = torch.clamp(indices, 1, times.shape[0] - 1)
+    lo = times[indices - 1]
+    hi = times[indices]
+    # The 8192-point cache already brackets each root within ~1.2e-4 in time;
+    # 24 local iterations reach float64 accuracy and saturate float32 earlier.
+    for _ in range(24):
+      mid = 0.5 * (lo + hi)
+      too_early = self.log_snr(mid) > targets
+      lo = torch.where(too_early, mid, lo)
+      hi = torch.where(too_early, hi, mid)
+    return 0.5 * (lo + hi)
+
   def _uniform_logsnr_grid(self, eps, num_steps, device, dtype):
     """Reverse-time grid (T -> eps) with uniformly spaced log-SNR.
 
@@ -591,19 +747,22 @@ class FoxVPSDE(SDE):
 
     eps_t = torch.tensor(float(eps), device=device, dtype=dtype)
     T_t = torch.tensor(float(self.T), device=device, dtype=dtype)
-    lam_eps = self.log_snr(eps_t.reshape(1))[0]
-    lam_T = self.log_snr(T_t.reshape(1))[0]
+    configured_min = getattr(self, 'sampling_logsnr_min', None)
+    configured_max = getattr(self, 'sampling_logsnr_max', None)
+    if (configured_min is None) != (configured_max is None):
+      raise ValueError('Both sampling log-SNR endpoints must be set together.')
+    if configured_min is None:
+      lam_eps = self.log_snr(eps_t.reshape(1))[0]
+      lam_T = self.log_snr(T_t.reshape(1))[0]
+    else:
+      lam_T = torch.tensor(float(configured_min), device=device, dtype=dtype)
+      lam_eps = torch.tensor(float(configured_max), device=device, dtype=dtype)
+      T_t = self.time_from_log_snr(lam_T.reshape(1))[0]
+      eps_t = self.time_from_log_snr(lam_eps.reshape(1))[0]
     targets = torch.linspace(lam_T.item(), lam_eps.item(), num_steps,
                              device=device, dtype=dtype)
 
-    lo = torch.full_like(targets, float(eps))
-    hi = torch.full_like(targets, float(self.T))
-    for _ in range(64):
-      mid = 0.5 * (lo + hi)
-      too_small = self.log_snr(mid) > targets     # lam decreasing -> t below target
-      lo = torch.where(too_small, mid, lo)
-      hi = torch.where(too_small, hi, mid)
-    timesteps = 0.5 * (lo + hi)
+    timesteps = self.time_from_log_snr(targets)
     timesteps[0] = T_t
     timesteps[-1] = eps_t
     return timesteps
@@ -617,7 +776,18 @@ class FoxVPSDE(SDE):
       dtype = self._schedule_times_cpu.dtype
 
     if grid == 'uniform_time':
-      return torch.linspace(self.T, eps, num_steps, device=device, dtype=dtype)
+      configured_min = getattr(self, 'sampling_logsnr_min', None)
+      configured_max = getattr(self, 'sampling_logsnr_max', None)
+      if configured_min is None and configured_max is None:
+        return torch.linspace(self.T, eps, num_steps, device=device, dtype=dtype)
+      if configured_min is None or configured_max is None:
+        raise ValueError('Both sampling log-SNR endpoints must be set together.')
+      start = self.time_from_log_snr(torch.tensor(
+        [float(configured_min)], device=device, dtype=dtype))[0]
+      end = self.time_from_log_snr(torch.tensor(
+        [float(configured_max)], device=device, dtype=dtype))[0]
+      return torch.linspace(start.item(), end.item(), num_steps,
+                            device=device, dtype=dtype)
     if grid == 'uniform_logsnr':
       return self._uniform_logsnr_grid(eps, num_steps, device, dtype)
     if grid != 'uniform_variance':

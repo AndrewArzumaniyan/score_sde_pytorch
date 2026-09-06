@@ -62,36 +62,55 @@ from utils import (checkpoint_filename, latest_immutable_checkpoint,
 FLAGS = flags.FLAGS
 
 
+def _configure_sde_controls(sde, config):
+  """Attach opt-in conditioning and common sampling endpoints to an SDE."""
+  conditioning = getattr(config.model, 'noise_conditioning', 'time')
+  if conditioning not in ('time', 'logsnr'):
+    raise ValueError(
+      f'Unsupported model.noise_conditioning={conditioning!r}.')
+  sde.noise_conditioning = conditioning
+  sde.conditioning_logsnr_min = getattr(config.model, 'logsnr_min', None)
+  sde.conditioning_logsnr_max = getattr(config.model, 'logsnr_max', None)
+  if conditioning == 'logsnr' and (
+      sde.conditioning_logsnr_min is None or
+      sde.conditioning_logsnr_max is None):
+    raise ValueError(
+      'log-SNR conditioning requires model.logsnr_min and model.logsnr_max.')
+  sde.sampling_logsnr_min = getattr(config.sampling, 'logsnr_min', None)
+  sde.sampling_logsnr_max = getattr(config.sampling, 'logsnr_max', None)
+  return sde
+
+
 def get_sde(config, n_override=None):
   num_scales = config.model.num_scales if n_override is None else n_override
   sde_name = config.training.sde.lower()
   if sde_name == 'vpsde':
-    return sde_lib.VPSDE(
+    return _configure_sde_controls(sde_lib.VPSDE(
       beta_min=config.model.beta_min,
       beta_max=config.model.beta_max,
       N=num_scales,
-    ), 1e-3
+    ), config), 1e-3
   if sde_name == 'cosinevpsde':
-    return sde_lib.CosineVPSDE(
+    return _configure_sde_controls(sde_lib.CosineVPSDE(
       s=config.model.cosine_s,
       t_max=config.model.cosine_t_max,
       max_beta=config.model.cosine_max_beta,
       N=num_scales,
-    ), 1e-3
+    ), config), 1e-3
   if sde_name == 'subvpsde':
-    return sde_lib.subVPSDE(
+    return _configure_sde_controls(sde_lib.subVPSDE(
       beta_min=config.model.beta_min,
       beta_max=config.model.beta_max,
       N=num_scales,
-    ), 1e-3
+    ), config), 1e-3
   if sde_name == 'vesde':
-    return sde_lib.VESDE(
+    return _configure_sde_controls(sde_lib.VESDE(
       sigma_min=config.model.sigma_min,
       sigma_max=config.model.sigma_max,
       N=num_scales,
-    ), 1e-5
+    ), config), 1e-5
   if sde_name == 'foxvpsde':
-    return sde_lib.FoxVPSDE(
+    return _configure_sde_controls(sde_lib.FoxVPSDE(
       u=config.model.fox_u,
       drift_schedule=getattr(config.model, 'fox_drift_schedule', 'constant'),
       beta_min=getattr(config.model, 'fox_beta_min', config.model.beta_min),
@@ -108,11 +127,11 @@ def get_sde(config, n_override=None):
       schedule_grid_size=config.model.fox_schedule_grid_size,
       target_terminal_variance=getattr(config.model, 'fox_target_terminal_variance', None),
       N=num_scales,
-    ), 1e-3
+    ), config), 1e-3
   if sde_name == 'edm':
     num_steps = (getattr(config.sampling, 'edm_num_steps', 18)
                  if n_override is None else n_override)
-    return edm_lib.EDM(
+    return _configure_sde_controls(edm_lib.EDM(
       sigma_data=config.model.edm_sigma_data,
       p_mean=config.training.edm_p_mean,
       p_std=config.training.edm_p_std,
@@ -125,8 +144,40 @@ def get_sde(config, n_override=None):
       s_noise=config.sampling.edm_s_noise,
       augmentation=getattr(config.training, 'edm_augmentation', False),
       N=num_steps,
-    ), 0.0
+    ), config), 0.0
   raise NotImplementedError(f"SDE {config.training.sde} unknown.")
+
+
+def get_training_noise_sde(config, target_sde):
+  """Build the clock whose uniform time induces the requested p(log-SNR)."""
+  distribution = getattr(config.training, 'noise_distribution', 'uniform_time')
+  if distribution == 'uniform_time':
+    return None
+  if distribution == 'vp_time':
+    return sde_lib.VPSDE(
+      beta_min=config.training.noise_vp_beta_min,
+      beta_max=config.training.noise_vp_beta_max,
+      N=target_sde.N)
+  if distribution == 'normalized_fox_time':
+    return sde_lib.FoxVPSDE(
+      u=config.training.noise_fox_u,
+      drift_schedule=config.training.noise_fox_drift_schedule,
+      beta_min=config.training.noise_fox_beta_min,
+      beta_max=config.training.noise_fox_beta_max,
+      diffusion_scale=config.training.noise_fox_diffusion_scale,
+      kernel=config.training.noise_fox_kernel,
+      gaussian_sigma=config.training.noise_fox_gaussian_sigma,
+      power_law_alpha=config.training.noise_fox_power_law_alpha,
+      power_law_tau0=config.training.noise_fox_power_law_tau0,
+      matern_length_scale=config.training.noise_fox_matern_length_scale,
+      drift_k_bar=config.training.noise_fox_drift_k_bar,
+      drift_a=config.training.noise_fox_drift_a,
+      normalize_scale=True,
+      schedule_grid_size=config.training.noise_fox_schedule_grid_size,
+      target_terminal_variance=config.training.noise_fox_target_terminal_variance,
+      N=target_sde.N)
+  raise ValueError(
+    f'Unsupported training.noise_distribution={distribution!r}.')
 
 
 def train(config, workdir):
@@ -212,6 +263,9 @@ def train(config, workdir):
 
   # Setup SDEs
   sde, sampling_eps = get_sde(config)
+  training_noise_sde = get_training_noise_sde(config, sde)
+  training_logsnr_min = getattr(config.model, 'logsnr_min', None)
+  training_logsnr_max = getattr(config.model, 'logsnr_max', None)
 
   # Build one-step training and evaluation functions
   optimize_fn = losses.optimization_manager(config)
@@ -222,10 +276,16 @@ def train(config, workdir):
   train_step_fn = losses.get_step_fn(sde, train=True, optimize_fn=optimize_fn,
                                      reduce_mean=reduce_mean, continuous=continuous,
                                      likelihood_weighting=likelihood_weighting,
-                                     ema_decay_fn=ema_decay_fn)
+                                     ema_decay_fn=ema_decay_fn,
+                                     noise_distribution_sde=training_noise_sde,
+                                     logsnr_min=training_logsnr_min,
+                                     logsnr_max=training_logsnr_max)
   eval_step_fn = losses.get_step_fn(sde, train=False, optimize_fn=optimize_fn,
                                     reduce_mean=reduce_mean, continuous=continuous,
-                                    likelihood_weighting=likelihood_weighting)
+                                    likelihood_weighting=likelihood_weighting,
+                                    noise_distribution_sde=training_noise_sde,
+                                    logsnr_min=training_logsnr_min,
+                                    logsnr_max=training_logsnr_max)
 
   # Building sampling functions
   if config.training.snapshot_sampling:
@@ -382,6 +442,7 @@ def evaluate(config,
   # Setup SDEs. Keep the training SDE for loss/BPD, but allow eval-only
   # sampling to use a different number of discretization steps.
   sde, sampling_eps = get_sde(config)
+  training_noise_sde = get_training_noise_sde(config, sde)
   sampling_num_scales = getattr(config.eval, 'sampling_num_scales', 0)
   sampling_sde = sde
   if sampling_num_scales and sampling_num_scales > 0:
@@ -397,7 +458,12 @@ def evaluate(config,
     eval_step = losses.get_step_fn(sde, train=False, optimize_fn=optimize_fn,
                                    reduce_mean=reduce_mean,
                                    continuous=continuous,
-                                   likelihood_weighting=likelihood_weighting)
+                                   likelihood_weighting=likelihood_weighting,
+                                   noise_distribution_sde=training_noise_sde,
+                                   logsnr_min=getattr(
+                                     config.model, 'logsnr_min', None),
+                                   logsnr_max=getattr(
+                                     config.model, 'logsnr_max', None))
 
 
   # Build raw [0, 1] data for likelihood evaluation. Uniform dequantization is

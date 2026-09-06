@@ -67,7 +67,32 @@ def optimization_manager(config):
   return optimize_fn
 
 
-def get_sde_loss_fn(sde, train, reduce_mean=True, continuous=True, likelihood_weighting=True, eps=1e-5):
+def sample_sde_time(sde, batch_size, device, eps, noise_distribution_sde=None,
+                    logsnr_min=None, logsnr_max=None, dtype=torch.float32):
+  """Sample target time, optionally through another SDE's uniform clock."""
+  random_values = torch.rand(batch_size, device=device, dtype=dtype)
+  if noise_distribution_sde is None:
+    return random_values * (sde.T - eps) + eps
+  if logsnr_min is None or logsnr_max is None:
+    raise ValueError(
+      'A cross-SDE noise distribution requires common log-SNR endpoints.')
+  if not float(logsnr_max) > float(logsnr_min):
+    raise ValueError('logsnr_max must be greater than logsnr_min.')
+  lambda_min = torch.tensor(
+    [float(logsnr_min)], device=device, dtype=dtype)
+  lambda_max = torch.tensor(
+    [float(logsnr_max)], device=device, dtype=dtype)
+  source_start = noise_distribution_sde.time_from_log_snr(lambda_max)[0]
+  source_end = noise_distribution_sde.time_from_log_snr(lambda_min)[0]
+  source_t = source_start + random_values * (source_end - source_start)
+  sampled_logsnr = noise_distribution_sde.log_snr(source_t)
+  return sde.time_from_log_snr(sampled_logsnr)
+
+
+def get_sde_loss_fn(sde, train, reduce_mean=True, continuous=True,
+                    likelihood_weighting=True, eps=1e-5,
+                    noise_distribution_sde=None, logsnr_min=None,
+                    logsnr_max=None):
   """Create a loss function for training with arbirary SDEs.
 
   Args:
@@ -96,7 +121,11 @@ def get_sde_loss_fn(sde, train, reduce_mean=True, continuous=True, likelihood_we
       loss: A scalar that represents the average loss value across the mini-batch.
     """
     score_fn = mutils.get_score_fn(sde, model, train=train, continuous=continuous)
-    t = torch.rand(batch.shape[0], device=batch.device) * (sde.T - eps) + eps
+    t = sample_sde_time(
+      sde, batch.shape[0], batch.device, eps,
+      noise_distribution_sde=noise_distribution_sde,
+      logsnr_min=logsnr_min, logsnr_max=logsnr_max,
+      dtype=batch.dtype)
     z = torch.randn_like(batch)
     mean, std = sde.marginal_prob(batch, t)
     perturbed_data = mean + std[:, None, None, None] * z
@@ -195,7 +224,9 @@ def get_ddpm_loss_fn(vpsde, train, reduce_mean=True):
 
 
 def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True,
-                likelihood_weighting=False, ema_decay_fn=None):
+                likelihood_weighting=False, ema_decay_fn=None,
+                noise_distribution_sde=None, logsnr_min=None,
+                logsnr_max=None):
   """Create a one-step training/evaluation function.
 
   Args:
@@ -213,7 +244,11 @@ def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True
     loss_fn = get_edm_loss_fn(sde, train, reduce_mean=reduce_mean)
   elif continuous:
     loss_fn = get_sde_loss_fn(sde, train, reduce_mean=reduce_mean,
-                              continuous=True, likelihood_weighting=likelihood_weighting)
+                              continuous=True,
+                              likelihood_weighting=likelihood_weighting,
+                              noise_distribution_sde=noise_distribution_sde,
+                              logsnr_min=logsnr_min,
+                              logsnr_max=logsnr_max)
   else:
     assert not likelihood_weighting, "Likelihood weighting is not supported for original SMLD/DDPM training."
     if isinstance(sde, VESDE):
