@@ -2,15 +2,21 @@
 # Eval-only controls for the historical VP and real (unnormalized) FOX models.
 # core: FOX at both endpoints, NFE 1000 (matched to completed VP evaluations).
 # nfe: VP and FOX at both endpoints, NFE 1077 (grid-spacing control).
-# all: both groups. No training or checkpoint changes.
+# all: both groups.
+# confirm: VP and FOX at extended endpoint, NFE 1000, 50k samples.
+# No training or checkpoint changes.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 STAGE="${ENDPOINT_1300K_STAGE:-core}"
-case "$STAGE" in core|nfe|all) ;; *) echo "ENDPOINT_1300K_STAGE must be core, nfe, or all" >&2; exit 2 ;; esac
-NUM_SAMPLES="${ENDPOINT_1300K_NUM_SAMPLES:-10000}"
+case "$STAGE" in core|nfe|all|confirm) ;; *) echo "ENDPOINT_1300K_STAGE must be core, nfe, all, or confirm" >&2; exit 2 ;; esac
+if [[ "$STAGE" == confirm ]]; then
+  NUM_SAMPLES="${ENDPOINT_1300K_NUM_SAMPLES:-50000}"
+else
+  NUM_SAMPLES="${ENDPOINT_1300K_NUM_SAMPLES:-10000}"
+fi
 CHECKPOINT="${ENDPOINT_1300K_CKPT:-260}"
 SEED="${ENDPOINT_1300K_SEED:-0}"
 ALLOW_TF32="${FACTORIAL_ALLOW_TF32:-True}"
@@ -29,7 +35,7 @@ if [[ "$STAGE" == core || "$STAGE" == all ]]; then
     echo "Missing FOX checkpoint ${CHECKPOINT} in $FOX_WORKDIR" >&2; exit 1;
   }
 fi
-if [[ "$STAGE" == nfe || "$STAGE" == all ]]; then
+if [[ "$STAGE" == nfe || "$STAGE" == all || "$STAGE" == confirm ]]; then
   for workdir in "$VP_WORKDIR" "$FOX_WORKDIR"; do
     [[ -f "$workdir/checkpoints/checkpoint_${CHECKPOINT}.pth" ]] || {
       echo "Missing checkpoint ${CHECKPOINT} in $workdir" >&2; exit 1;
@@ -97,4 +103,8 @@ if [[ "$STAGE" == nfe || "$STAGE" == all ]]; then
     run_eval vp "$endpoint" 1077 "$VP_WORKDIR"
     run_eval fox "$endpoint" 1077 "$FOX_WORKDIR"
   done
+fi
+if [[ "$STAGE" == confirm ]]; then
+  run_eval vp extended 1000 "$VP_WORKDIR"
+  run_eval fox extended 1000 "$FOX_WORKDIR"
 fi
