@@ -12,14 +12,19 @@ import os
 import sys
 from pathlib import Path
 
+import torch
+
+# Match run_lib/main: initialize Torch CUDA before importing TensorFlow.
+# Reversing this order can segfault in the H200 CUDA 12.1 image.
+if torch.cuda.is_available():
+  torch.cuda.init()
+
 import numpy as np
+import tensorflow as tf
+import tensorflow_datasets as tfds
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-
-import tensorflow as tf
-import tensorflow_datasets as tfds
-import torch
 
 import datasets
 import losses
@@ -193,6 +198,8 @@ def main():
     parser.error('seed must be nonnegative')
   if len(set(args.checkpoints)) != len(args.checkpoints):
     parser.error('checkpoint list contains duplicates')
+  print('E2 startup: pilot=%s images=%d checkpoints=%s' %
+        (args.pilot, args.num_images, args.checkpoints), flush=True)
   tf.config.set_visible_devices([], 'GPU')
   if not torch.cuda.is_available():
     raise RuntimeError('E2 requires the selected CUDA GPU')
@@ -209,8 +216,11 @@ def main():
       path = workdir / 'checkpoints' / ('checkpoint_%d.pth' % ckpt)
       if not path.is_file():
         raise FileNotFoundError(str(path))
+  print('Loading CelebA test images', flush=True)
   images, source = load_test_images(vp, args.num_images)
+  print('Loaded %d images from %s' % (len(images), source), flush=True)
   image_hash = hashlib.sha256(memoryview(images)).hexdigest()
+  print('Building VP and real FOX SDEs', flush=True)
   vp_sde, _ = get_sde(vp)
   fox_sde, _ = get_sde(fox)
   parameters = {
