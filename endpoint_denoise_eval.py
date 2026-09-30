@@ -17,7 +17,7 @@ VARIANTS = ('x_mean', 'x_t', 'tweedie_xt')
 
 def _read_npz(filename, protocol_sha256, checkpoint_id, checkpoint_step,
               training_protocol, round_id=None, sampling_seed=None,
-              required_arrays=()):
+              required_arrays=(), extra_identity=None):
   with tf.io.gfile.GFile(filename, 'rb') as input_file:
     with np.load(input_file) as archive:
       validate_npz_metadata(
@@ -25,13 +25,15 @@ def _read_npz(filename, protocol_sha256, checkpoint_id, checkpoint_step,
         round_id=round_id, sampling_seed=sampling_seed,
         required_arrays=required_arrays,
         checkpoint_step=checkpoint_step,
-        training_protocol_sha256=training_protocol)
+        training_protocol_sha256=training_protocol,
+        extra_identity=extra_identity)
       return {key: np.asarray(archive[key]).copy() for key in archive.files}
 
 
 def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
                         inception_model, protocol_sha256, checkpoint_id,
-                        checkpoint_step, training_protocol, artifact_identity):
+                        checkpoint_step, training_protocol, artifact_identity,
+                        extra_identity=None):
   """Generate three image outputs per trajectory and evaluate each identically."""
   if config.data.dataset != 'CELEBA' or config.data.image_size != 64:
     raise ValueError('E4 endpoint denoise evaluation is restricted to CelebA 64.')
@@ -44,7 +46,9 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
   tf.io.gfile.makedirs(sample_dir)
   pools = {variant: [] for variant in VARIANTS}
   logits = {variant: [] for variant in VARIANTS}
-  sample_keys = tuple(f'samples_{variant}' for variant in VARIANTS) + ('nfe',)
+  route_metadata = getattr(score_model, 'expected_route_metadata', None)
+  route_keys = tuple(route_metadata) if route_metadata is not None else ()
+  sample_keys = tuple(f'samples_{variant}' for variant in VARIANTS) + ('nfe',) + route_keys
   stat_keys = tuple(
     key for variant in VARIANTS
     for key in (f'pool_3_{variant}', f'logits_{variant}')) + ('num_samples', 'nfe')
@@ -57,11 +61,15 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
       samples = _read_npz(
         sample_file, protocol_sha256, checkpoint_id, checkpoint_step,
         training_protocol, round_id=round_id, sampling_seed=seed,
-        required_arrays=sample_keys)
+        required_arrays=sample_keys, extra_identity=extra_identity)
       logging.info('E4: reuse sample batch %d', round_id)
     else:
+      if route_metadata is not None:
+        score_model.reset_route()
       with isolated_torch_rng(seed):
         outputs, nfe = sampling_fn(score_model)
+      if route_metadata is not None:
+        score_model.checked_route_metadata()
       if set(outputs) != set(VARIANTS):
         raise ValueError(f'Unexpected E4 sampler outputs: {tuple(outputs)}')
       samples = {
@@ -72,7 +80,14 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
       }
       samples.update(nfe=np.asarray(nfe), round_id=np.asarray(round_id),
                      sampling_seed=np.asarray(seed), **artifact_identity)
+      if route_metadata is not None:
+        samples.update({key: np.asarray(value)
+                        for key, value in route_metadata.items()})
       atomic_savez(sample_file, overwrite=False, **samples)
+    if route_metadata is not None:
+      for key, expected in route_metadata.items():
+        if not np.isclose(np.asarray(samples[key]), expected, rtol=0, atol=1e-5):
+          raise ValueError(f'Incorrect splice route {key}: {sample_file}')
     if int(np.asarray(samples['nfe'])) != int(config.eval.sampling_num_scales) + 1:
       raise ValueError(f'Incorrect E4 network evaluation count: {sample_file}')
     for variant in VARIANTS:
@@ -86,7 +101,7 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
       stats = _read_npz(
         stat_file, protocol_sha256, checkpoint_id, checkpoint_step,
         training_protocol, round_id=round_id, sampling_seed=seed,
-        required_arrays=stat_keys)
+        required_arrays=stat_keys, extra_identity=extra_identity)
       logging.info('E4: reuse Inception batch %d', round_id)
     else:
       stats = dict(round_id=np.asarray(round_id), sampling_seed=np.asarray(seed),
@@ -116,6 +131,13 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
                 dataset_stats_id=np.asarray(data_stats_id),
                 nfe=np.asarray(int(config.eval.sampling_num_scales) + 1),
                 **artifact_identity)
+  if route_metadata is not None:
+    report.update({key: np.asarray(value)
+                   for key, value in route_metadata.items()})
+    report['splice_vp_calls_total'] = np.asarray(
+      rounds * route_metadata['splice_vp_calls'])
+    report['splice_fox_calls_total'] = np.asarray(
+      rounds * route_metadata['splice_fox_calls'])
   data_pools = data_stats['pool_3']
   for variant in VARIANTS:
     all_pools = np.concatenate(pools[variant], axis=0)[:requested]
@@ -139,7 +161,7 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
     saved = _read_npz(
       report_path, protocol_sha256, checkpoint_id, checkpoint_step,
       training_protocol,
-      required_arrays=tuple(report.keys()))
+      required_arrays=tuple(report.keys()), extra_identity=extra_identity)
     if str(np.asarray(saved['dataset_stats_id']).item()) != data_stats_id or \
         int(np.asarray(saved['num_samples'])) != requested or \
         int(np.asarray(saved['nfe'])) != int(np.asarray(report['nfe'])):

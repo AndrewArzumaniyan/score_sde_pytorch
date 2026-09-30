@@ -46,6 +46,7 @@ from models.ema import ExponentialMovingAverage
 import datasets
 import evaluation
 import endpoint_denoise_eval
+from splice_model import SplicedEpsModel
 import likelihood
 import sde_lib
 import edm_lib
@@ -493,6 +494,11 @@ def evaluate(config,
   if endpoint_variants and (not config.eval.enable_sampling or
                             config.eval.enable_loss or config.eval.enable_bpd):
     raise ValueError('Endpoint denoise evaluation requires sampling only.')
+  splice_enabled = bool(getattr(config.eval, 'splice_enabled', False))
+  if splice_enabled and (not endpoint_variants or
+                         config.training.sde.lower() != 'vpsde' or
+                         getattr(config.model, 'noise_conditioning', 'time') != 'time'):
+    raise ValueError('E3b splice requires endpoint variants and time-conditioned VP.')
   if config.eval.enable_sampling:
     sampling_shape = (config.eval.batch_size,
                       config.data.num_channels,
@@ -502,6 +508,38 @@ def evaluate(config,
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
   inception_model = evaluation.get_inception_model(inceptionv3=inceptionv3)
+
+  if splice_enabled:
+    alt_config = config.eval.splice_alt
+    if (alt_config.training.sde.lower() != 'foxvpsde' or
+        getattr(alt_config.model, 'noise_conditioning', 'time') != 'time'):
+      raise ValueError('E3b alternate model must be time-conditioned FOX.')
+    alt_model = mutils.create_model(alt_config)
+    alt_optimizer = losses.get_optimizer(alt_config, alt_model.parameters())
+    alt_ema = ExponentialMovingAverage(
+      alt_model.parameters(), decay=alt_config.model.ema_rate)
+    alt_manifest = build_model_manifest(alt_config)
+    alt_state = dict(
+      optimizer=alt_optimizer, model=alt_model, ema=alt_ema, step=0,
+      model_protocol_sha256=alt_manifest['model_protocol_sha256'])
+    alt_ckpt_path = os.path.join(
+      config.eval.splice_alt_workdir, 'checkpoints',
+      f'checkpoint_{int(config.eval.splice_alt_ckpt)}.pth')
+    if not tf.io.gfile.exists(alt_ckpt_path):
+      raise FileNotFoundError(f'Missing alternate checkpoint: {alt_ckpt_path}')
+    alt_state = restore_checkpoint(
+      alt_ckpt_path, alt_state, device=config.device, restore_rng=False)
+    alt_ema.copy_to(alt_model.parameters())
+    alt_sde, _ = get_sde(alt_config)
+    alt_identity = dict(
+      alt_checkpoint_id=np.asarray(alt_state['checkpoint_id']),
+      alt_checkpoint_step=np.asarray(int(alt_state['step'])),
+      alt_training_protocol_sha256=np.asarray(
+        alt_state.get('training_protocol_sha256') or 'legacy-unknown'))
+    logging.info(
+      'E3b alternate FOX checkpoint: %s, step=%s, training protocol=%s',
+      alt_identity['alt_checkpoint_id'], alt_identity['alt_checkpoint_step'],
+      alt_identity['alt_training_protocol_sha256'])
 
   begin_ckpt = config.eval.begin_ckpt
   checkpoint_targets = [
@@ -543,10 +581,23 @@ def evaluate(config,
       training_protocol_sha256=np.asarray(training_protocol))
     ema.copy_to(score_model.parameters())
     if endpoint_variants:
+      sampling_model = score_model
+      extra_identity = None
+      if splice_enabled:
+        sampling_model = SplicedEpsModel(
+          score_model, alt_model, sampling_sde, alt_sde,
+          mode=config.eval.splice_mode,
+          threshold=getattr(config.eval, 'splice_lambda', None),
+          sampling_eps=sampling_eps,
+          time_grid=config.sampling.time_grid, device=config.device).eval()
+        artifact_identity.update(alt_identity)
+        extra_identity = alt_identity
+        logging.info('E3b splice route: %s',
+                     sampling_model.expected_route_metadata)
       endpoint_denoise_eval.evaluate_checkpoint(
-        config, eval_dir, ckpt, score_model, sampling_fn, inception_model,
+        config, eval_dir, ckpt, sampling_model, sampling_fn, inception_model,
         protocol_sha256, checkpoint_id, checkpoint_step,
-        training_protocol, artifact_identity)
+        training_protocol, artifact_identity, extra_identity=extra_identity)
       continue
     # Compute the loss function on the full evaluation dataset if loss computation is enabled
     if config.eval.enable_loss:

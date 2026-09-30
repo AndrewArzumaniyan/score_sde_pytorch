@@ -266,7 +266,7 @@ def scalar_string(value):
 def validate_npz_metadata(archive, path, protocol_sha256, checkpoint_id,
                           round_id=None, sampling_seed=None,
                           required_arrays=(), checkpoint_step=None,
-                          training_protocol_sha256=None):
+                          training_protocol_sha256=None, extra_identity=None):
   """Reject stale or partially incompatible cached evaluation artifacts."""
   required = {'protocol_sha256', 'checkpoint_id'}
   missing = sorted(required.difference(archive.files))
@@ -288,6 +288,11 @@ def validate_npz_metadata(archive, path, protocol_sha256, checkpoint_id,
         str(training_protocol_sha256)):
       raise ValueError(
         f'Cached artifact has a different training protocol: {path}')
+  for key, expected in (extra_identity or {}).items():
+    if (key not in archive.files or
+        scalar_string(archive[key]) != scalar_string(expected)):
+      raise ValueError(
+        f'Cached artifact has a different or missing {key}: {path}')
   if round_id is not None:
     if 'round_id' not in archive.files or int(np.asarray(archive['round_id']).item()) != round_id:
       raise ValueError(f'Cached artifact has a different sampling round: {path}')
