@@ -45,6 +45,7 @@ from models import utils as mutils
 from models.ema import ExponentialMovingAverage
 import datasets
 import evaluation
+import endpoint_denoise_eval
 import likelihood
 import sde_lib
 import edm_lib
@@ -488,6 +489,10 @@ def evaluate(config,
     likelihood_fn = likelihood.get_likelihood_fn(sde, inverse_scaler)
 
   # Build the sampling function when sampling is enabled
+  endpoint_variants = bool(getattr(config.eval, 'endpoint_denoise_variants', False))
+  if endpoint_variants and (not config.eval.enable_sampling or
+                            config.eval.enable_loss or config.eval.enable_bpd):
+    raise ValueError('Endpoint denoise evaluation requires sampling only.')
   if config.eval.enable_sampling:
     sampling_shape = (config.eval.batch_size,
                       config.data.num_channels,
@@ -537,6 +542,12 @@ def evaluate(config,
       checkpoint_step=np.asarray(checkpoint_step),
       training_protocol_sha256=np.asarray(training_protocol))
     ema.copy_to(score_model.parameters())
+    if endpoint_variants:
+      endpoint_denoise_eval.evaluate_checkpoint(
+        config, eval_dir, ckpt, score_model, sampling_fn, inception_model,
+        protocol_sha256, checkpoint_id, checkpoint_step,
+        training_protocol, artifact_identity)
+      continue
     # Compute the loss function on the full evaluation dataset if loss computation is enabled
     if config.eval.enable_loss:
       loss_path = os.path.join(eval_dir, f"ckpt_{ckpt}_loss.npz")

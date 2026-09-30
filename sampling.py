@@ -94,6 +94,9 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
   """
 
   sampler_name = config.sampling.method
+  endpoint_variants = bool(getattr(config.eval, 'endpoint_denoise_variants', False))
+  if endpoint_variants and sampler_name.lower() != 'pc':
+    raise ValueError('Endpoint denoise variants require the PC sampler.')
   if sampler_name.lower() == 'edm':
     if not isinstance(sde, edm_lib.EDM):
       raise ValueError('The EDM sampler requires an EDM configuration object.')
@@ -120,6 +123,7 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
                                  probability_flow=config.sampling.probability_flow,
                                  continuous=config.training.continuous,
                                  denoise=config.sampling.noise_removal,
+                                 endpoint_variants=endpoint_variants,
                                  time_grid=config.sampling.time_grid,
                                  eps=eps,
                                  device=config.device)
@@ -415,7 +419,8 @@ def shared_corrector_update_fn(x, t, sde, model, corrector, continuous, snr, n_s
 
 def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
                    n_steps=1, probability_flow=False, continuous=False,
-                   denoise=True, time_grid='uniform_time', eps=1e-3, device='cuda'):
+                   denoise=True, time_grid='uniform_time', eps=1e-3,
+                   device='cuda', endpoint_variants=False):
   """Create a Predictor-Corrector (PC) sampler.
 
   Args:
@@ -428,7 +433,8 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
     n_steps: An integer. The number of corrector steps per predictor update.
     probability_flow: If `True`, solve the reverse-time probability flow ODE when running the predictor.
     continuous: `True` indicates that the score model was continuously trained.
-    denoise: If `True`, add one-step denoising to the final samples.
+    denoise: If `True`, return the mean of the final predictor step.
+    endpoint_variants: Return paired x_mean, x_t and Tweedie(x_t) outputs.
     eps: A `float` number. The reverse-time SDE and ODE are integrated to `epsilon` to avoid numerical issues.
     device: PyTorch device.
 
@@ -450,6 +456,12 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
   predictor_nfe = 0 if predictor in (None, NonePredictor) else 1
   corrector_nfe = 0 if corrector in (None, NoneCorrector) else n_steps
   nfe = sde.N * (predictor_nfe + corrector_nfe)
+  if endpoint_variants and (predictor is not EulerMaruyamaPredictor or
+                            corrector is not NoneCorrector or
+                            probability_flow or not continuous or not denoise):
+    raise ValueError(
+      'Endpoint denoise variants require continuous EM, no corrector, '
+      'probability_flow=False and noise_removal=True.')
 
   def get_time_grid():
     return sde.sampling_time_grid(
@@ -491,6 +503,21 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
         vec_t = torch.ones(shape[0], device=t.device) * t
         x, x_mean = corrector_update_fn(x, vec_t, model=model)
         x, x_mean = predictor_update_fn(x, vec_t, model=model, dt=dt)
+
+      if endpoint_variants:
+        # The final EM step uses timesteps[-2]; denoise its noisy output at
+        # the actual endpoint timesteps[-1] with one extra network call.
+        end_t = torch.ones(shape[0], device=x.device, dtype=x.dtype) * timesteps[-1]
+        score_fn = get_score_fn(sde, model, train=False, continuous=continuous)
+        score = score_fn(x, end_t)
+        alpha, sigma = sde.marginal_prob(
+          torch.ones_like(x[:, :1, :1, :1]), end_t)
+        x0 = (x + sigma[:, None, None, None] ** 2 * score) / alpha
+        return {
+          'x_mean': inverse_scaler(x_mean),
+          'x_t': inverse_scaler(x),
+          'tweedie_xt': inverse_scaler(x0),
+        }, nfe + 1
 
       return inverse_scaler(x_mean if denoise else x), nfe
 
