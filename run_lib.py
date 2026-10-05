@@ -495,10 +495,13 @@ def evaluate(config,
                             config.eval.enable_loss or config.eval.enable_bpd):
     raise ValueError('Endpoint denoise evaluation requires sampling only.')
   splice_enabled = bool(getattr(config.eval, 'splice_enabled', False))
+  splice_shared_logsnr = bool(
+    getattr(config.eval, 'splice_shared_logsnr_conditioning', False))
   if splice_enabled and (not endpoint_variants or
                          config.training.sde.lower() != 'vpsde' or
-                         getattr(config.model, 'noise_conditioning', 'time') != 'time'):
-    raise ValueError('E3b splice requires endpoint variants and time-conditioned VP.')
+                         (getattr(config.model, 'noise_conditioning', 'time') !=
+                          ('logsnr' if splice_shared_logsnr else 'time'))):
+    raise ValueError('Splice requires endpoint variants and matching VP conditioning.')
   if config.eval.enable_sampling:
     sampling_shape = (config.eval.batch_size,
                       config.data.num_channels,
@@ -511,9 +514,17 @@ def evaluate(config,
 
   if splice_enabled:
     alt_config = config.eval.splice_alt
-    if (alt_config.training.sde.lower() != 'foxvpsde' or
-        getattr(alt_config.model, 'noise_conditioning', 'time') != 'time'):
-      raise ValueError('E3b alternate model must be time-conditioned FOX.')
+    alt_conditioning = getattr(alt_config.model, 'noise_conditioning', 'time')
+    if splice_shared_logsnr:
+      if (alt_config.training.sde.lower() != 'vpsde' or
+          alt_conditioning != 'logsnr' or
+          float(alt_config.model.logsnr_min) != float(config.model.logsnr_min) or
+          float(alt_config.model.logsnr_max) != float(config.model.logsnr_max)):
+        raise ValueError(
+          'Shared-log-SNR splice requires VP models with identical conditioning bounds.')
+    elif (alt_config.training.sde.lower() != 'foxvpsde' or
+          alt_conditioning != 'time'):
+      raise ValueError('Native E3b alternate model must be time-conditioned FOX.')
     alt_model = mutils.create_model(alt_config)
     alt_optimizer = losses.get_optimizer(alt_config, alt_model.parameters())
     alt_ema = ExponentialMovingAverage(
@@ -537,7 +548,8 @@ def evaluate(config,
       alt_training_protocol_sha256=np.asarray(
         alt_state.get('training_protocol_sha256') or 'legacy-unknown'))
     logging.info(
-      'E3b alternate FOX checkpoint: %s, step=%s, training protocol=%s',
+      'Alternate checkpoint (%s conditioning): %s, step=%s, training protocol=%s',
+      'shared log-SNR' if splice_shared_logsnr else 'native FOX',
       alt_identity['alt_checkpoint_id'], alt_identity['alt_checkpoint_step'],
       alt_identity['alt_training_protocol_sha256'])
 
@@ -589,10 +601,11 @@ def evaluate(config,
           mode=config.eval.splice_mode,
           threshold=getattr(config.eval, 'splice_lambda', None),
           sampling_eps=sampling_eps,
-          time_grid=config.sampling.time_grid, device=config.device).eval()
+          time_grid=config.sampling.time_grid, device=config.device,
+          shared_logsnr_conditioning=splice_shared_logsnr).eval()
         artifact_identity.update(alt_identity)
         extra_identity = alt_identity
-        logging.info('E3b splice route: %s',
+        logging.info('Splice route (primary/alternate calls): %s',
                      sampling_model.expected_route_metadata)
       endpoint_denoise_eval.evaluate_checkpoint(
         config, eval_dir, ckpt, sampling_model, sampling_fn, inception_model,

@@ -15,6 +15,7 @@ cd "$ROOT_DIR"
 RUNS="${AB_ENDPOINT_DENOISE_RUNS:-A:extended B:extended A:common B:common}"
 CHECKPOINT="${AB_ENDPOINT_DENOISE_CKPT:-20}"
 NUM_SAMPLES="${AB_ENDPOINT_DENOISE_NUM_SAMPLES:-5000}"
+NFE="${AB_ENDPOINT_DENOISE_NFE:-1000}"
 BATCH_SIZE="${AB_ENDPOINT_DENOISE_BATCH_SIZE:-512}"
 SEED="${AB_ENDPOINT_DENOISE_SEED:-0}"
 ALLOW_TF32="${AB_ENDPOINT_DENOISE_ALLOW_TF32:-True}"
@@ -23,10 +24,10 @@ RUN_TAG="${AB_ENDPOINT_DENOISE_RUN_TAG:-v1}"
 A_WORKDIR="${AB_ENDPOINT_DENOISE_A_WORKDIR:-workdirs/celeba_factorial_A_vp_pvp_50k}"
 B_WORKDIR="${AB_ENDPOINT_DENOISE_B_WORKDIR:-workdirs/celeba_factorial_B_vp_pfox_50k}"
 
-for value in "$CHECKPOINT" "$NUM_SAMPLES" "$BATCH_SIZE" "$SEED"; do
+for value in "$CHECKPOINT" "$NUM_SAMPLES" "$BATCH_SIZE" "$SEED" "$NFE"; do
   [[ "$value" =~ ^[0-9]+$ ]] || { echo "A/B numeric settings must be nonnegative integers" >&2; exit 2; }
 done
-(( NUM_SAMPLES > 0 && BATCH_SIZE > 0 )) || { echo "Samples and batch size must be positive" >&2; exit 2; }
+(( NUM_SAMPLES > 0 && NFE > 0 && BATCH_SIZE > 0 )) || { echo "Samples, NFE, and batch size must be positive" >&2; exit 2; }
 [[ "$RUN_TAG" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "Invalid A/B run tag" >&2; exit 2; }
 for spec in $RUNS; do
   case "$spec" in A:common|A:extended|B:common|B:extended) ;; *) echo "Invalid run: $spec" >&2; exit 2 ;; esac
@@ -78,8 +79,8 @@ for spec in $RUNS; do
   endpoint="${spec#*:}"
   if [[ "$arm" == A ]]; then workdir="$A_WORKDIR"; else workdir="$B_WORKDIR"; fi
   lower_arm="$(echo "$arm" | tr 'A-Z' 'a-z')"
-  folder="eval_ab_endpoint_denoise_${RUN_TAG}_${arm}_${endpoint}_ckpt${CHECKPOINT}_nfe1000_${NUM_SAMPLES}samples_batch${BATCH_SIZE}_seed${SEED}"
-  echo "=== A/B $arm/$endpoint: ckpt=$CHECKPOINT, 1000 EM steps + 1 denoise, samples=$NUM_SAMPLES, seed=$SEED ==="
+  folder="eval_ab_endpoint_denoise_${RUN_TAG}_${arm}_${endpoint}_ckpt${CHECKPOINT}_nfe${NFE}_${NUM_SAMPLES}samples_batch${BATCH_SIZE}_seed${SEED}"
+  echo "=== A/B $arm/$endpoint: ckpt=$CHECKPOINT, $NFE EM steps + 1 denoise, samples=$NUM_SAMPLES, seed=$SEED ==="
   python -u main.py \
     --mode=eval --config="${TMP_CONFIG}:${lower_arm}_${endpoint}" \
     --workdir="$workdir" --eval_folder="$folder" \
@@ -90,7 +91,7 @@ for spec in $RUNS; do
     --config.eval.enable_loss=False \
     --config.eval.enable_sampling=True \
     --config.eval.enable_bpd=False \
-    --config.eval.sampling_num_scales=1000 \
+    --config.eval.sampling_num_scales="$NFE" \
     --config.eval.sampling_seed="$SEED" \
     --config.sampling.method=pc \
     --config.sampling.predictor=euler_maruyama \

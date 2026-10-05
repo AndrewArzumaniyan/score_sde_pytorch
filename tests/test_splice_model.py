@@ -89,6 +89,20 @@ def test_none_is_exact_identity():
   assert torch.equal(model(x, labels), network(x, labels))
 
 
+@pytest.mark.parametrize('mode,expected_network', [('none', 'A'), ('full', 'B')])
+def test_shared_logsnr_all_same_network_routes_are_exact(mode, expected_network):
+  vp, _ = sdes()
+  model_a = ExactGaussianEps(vp)
+  model_b = ExactGaussianEps(vp)
+  wrapper = SplicedEpsModel(
+    model_a, model_b, vp, vp, mode, device='cpu',
+    shared_logsnr_conditioning=True).eval()
+  x = torch.randn((2, 1, 2, 2))
+  labels = torch.full((2,), 125.0)
+  expected = model_a if expected_network == 'A' else model_b
+  assert torch.equal(wrapper(x, labels), expected(x, labels))
+
+
 
 def test_none_sampler_outputs_match_unwrapped_vp():
   vp, fox = sdes()

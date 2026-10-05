@@ -40,14 +40,16 @@ class SplicedEpsModel(nn.Module):
 
   def __init__(self, vp_model, fox_model, vp_sde, fox_sde, mode,
                threshold=None, sampling_eps=1e-3,
-               time_grid='uniform_logsnr', device='cpu'):
+               time_grid='uniform_logsnr', device='cpu',
+               shared_logsnr_conditioning=False):
     super().__init__()
     if mode not in ('full', 'none', 'tail', 'head'):
       raise ValueError(f'Unknown splice mode: {mode}')
     if mode in ('tail', 'head') and threshold is None:
       raise ValueError(f'{mode} requires a log-SNR threshold.')
     self.vp_model = vp_model
-    self.fox_adapter = NativeEpsAdapter(fox_model, vp_sde, fox_sde)
+    self.fox_adapter = (fox_model if shared_logsnr_conditioning else
+                        NativeEpsAdapter(fox_model, vp_sde, fox_sde))
     self.vp_sde = vp_sde
     self.mode = mode
     self.threshold = None if threshold is None else float(threshold)
