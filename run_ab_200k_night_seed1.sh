@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Run with bash from the repository; keeps tmux's interactive shell intact.
+# Run inside Docker with bash; keeps tmux's interactive shell intact.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
-export CUDA_VISIBLE_DEVICES=3
-export TFDS_DATA_DIR="$HOME/.cache/tfds"
-export TORCH_EXTENSIONS_DIR="$HOME/.cache/torch_extensions"
-export XDG_CACHE_HOME="$HOME/.cache"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export TFDS_DATA_DIR="${TFDS_DATA_DIR:-/workspace/score_sde_pytorch/.tfds}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/workspace/score_sde_pytorch/.torch_extensions}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/workspace/score_sde_pytorch/.cache}"
 # Do not inherit alternate workdirs or numerical flags from earlier queues.
 export AB_ENDPOINT_DENOISE_A_WORKDIR=workdirs/celeba_factorial_A_vp_pvp_50k
 export AB_ENDPOINT_DENOISE_B_WORKDIR=workdirs/celeba_factorial_B_vp_pfox_50k
@@ -49,7 +49,7 @@ splice() {
 }
 A="$AB_SPLICE_A_WORKDIR"
 B="$AB_SPLICE_B_WORKDIR"
-echo "Queue started on GPU 3 at $(date -Is)"
+echo "Queue started with CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES at $(date -Is)"
 endpoint night_smoke 512 1000 'A:common B:common'
 splice night_smoke 512 'none full'
 run "$((LIMIT - RESERVE))" python validate_ab_splice_identity.py \
