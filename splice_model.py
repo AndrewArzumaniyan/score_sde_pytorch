@@ -51,6 +51,7 @@ class SplicedEpsModel(nn.Module):
     self.fox_adapter = (fox_model if shared_logsnr_conditioning else
                         NativeEpsAdapter(fox_model, vp_sde, fox_sde))
     self.vp_sde = vp_sde
+    self.shared_logsnr_conditioning = shared_logsnr_conditioning
     self.mode = mode
     self.threshold = None if threshold is None else float(threshold)
     self.expected_routes, self.expected_route_metadata = self._expected_route(
@@ -112,7 +113,13 @@ class SplicedEpsModel(nn.Module):
     if labels.ndim != 1 or labels.shape[0] != x.shape[0] or \
         not bool(torch.all(labels == labels[0]).item()):
       raise ValueError('Every sampler call must use one time for the batch.')
-    actual_lambda = self._lambda((labels[:1] / 999).to(x.dtype))
+    if self.shared_logsnr_conditioning:
+      # get_score_fn passes a normalized log-SNR label, not t * 999.
+      lower = float(self.vp_sde.conditioning_logsnr_min)
+      upper = float(self.vp_sde.conditioning_logsnr_max)
+      actual_lambda = upper - (labels[:1] / 999) * (upper - lower)
+    else:
+      actual_lambda = self._lambda((labels[:1] / 999).to(x.dtype))
     fox = self._use_fox(actual_lambda)
     self.route_history.append(fox)
     if fox:

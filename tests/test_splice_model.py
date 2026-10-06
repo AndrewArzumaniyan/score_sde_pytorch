@@ -92,6 +92,8 @@ def test_none_is_exact_identity():
 @pytest.mark.parametrize('mode,expected_network', [('none', 'A'), ('full', 'B')])
 def test_shared_logsnr_all_same_network_routes_are_exact(mode, expected_network):
   vp, _ = sdes()
+  vp.conditioning_logsnr_min = -10.0
+  vp.conditioning_logsnr_max = 9.115429865459795
   model_a = ExactGaussianEps(vp)
   model_b = ExactGaussianEps(vp)
   wrapper = SplicedEpsModel(
@@ -101,6 +103,33 @@ def test_shared_logsnr_all_same_network_routes_are_exact(mode, expected_network)
   labels = torch.full((2,), 125.0)
   expected = model_a if expected_network == 'A' else model_b
   assert torch.equal(wrapper(x, labels), expected(x, labels))
+
+
+@pytest.mark.parametrize('mode', ['head', 'tail'])
+def test_shared_logsnr_sampler_routes_at_1000_steps(mode):
+  vp, _ = sdes(n=1000)
+  vp.sampling_logsnr_max = 9.115429865459795
+  vp.noise_conditioning = 'logsnr'
+  vp.conditioning_logsnr_min = -10.0
+  vp.conditioning_logsnr_max = 9.115429865459795
+  # Epsilon value is irrelevant here, but the real score wrapper must supply
+  # the labels so the regression covers the sampler/model interface.
+  class ZeroEps(torch.nn.Module):
+    def forward(self, x, labels):
+      return torch.zeros_like(x)
+  wrapper = SplicedEpsModel(
+    ZeroEps(), ZeroEps(), vp, vp, mode, -3.3, device='cpu',
+    shared_logsnr_conditioning=True).eval()
+  sampler = sampling.get_pc_sampler(
+    sde=vp, shape=(2, 1, 2, 2),
+    predictor=sampling.EulerMaruyamaPredictor,
+    corrector=sampling.NoneCorrector,
+    inverse_scaler=lambda x: x, snr=0.17,
+    continuous=True, denoise=True, endpoint_variants=True,
+    time_grid='uniform_logsnr', device='cpu')
+  sampler(wrapper)
+  meta = wrapper.checked_route_metadata()
+  assert meta['splice_fox_calls'] == (351 if mode == 'head' else 650)
 
 
 
