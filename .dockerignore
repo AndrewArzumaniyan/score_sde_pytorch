@@ -1,10 +1,14 @@
 .git
 __pycache__
 *.pyc
+*.log
 .pytest_cache
 .cache
+.cache_rtx
 .tfds
 .torch_extensions
+.torch_extensions_rtx
+datasets
 third_party/edm
 .miniforge3
 .conda*
@@ -12,6 +16,7 @@ results
 tmp
 workdirs
 artifacts
+run_e4_logs
 build
 dist
 *.egg-info

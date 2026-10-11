@@ -1,4 +1,4 @@
-# Build: docker build -f Dockerfile.rtx -t score-sde-rtx:latest .
+# Build: ./docker/build_rtx.sh
 ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 FROM ${CUDA_IMAGE}
 
@@ -9,18 +9,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TF_CPP_MIN_LOG_LEVEL=2 \
     CUDA_HOME=/usr/local/cuda \
     TORCH_CUDA_ARCH_LIST=12.0 \
-    MAX_JOBS=4 \
+    MAX_JOBS=8 \
     TFDS_DATA_DIR=/workspace/score_sde_pytorch/.tfds \
     TORCH_EXTENSIONS_DIR=/workspace/score_sde_pytorch/.torch_extensions_rtx \
-    XDG_CACHE_HOME=/workspace/score_sde_pytorch/.cache_rtx \
-    PATH=/opt/rtx-venv/bin:${PATH}
+    XDG_CACHE_HOME=/workspace/score_sde_pytorch/.cache_rtx
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates git build-essential ninja-build \
-    python3.10 python3.10-dev python3.10-venv \
+    python3.10 python3.10-dev python3-distutils \
+    python3-pip python3-setuptools python3-wheel \
     libglib2.0-0 libsm6 libxext6 libxrender1 \
-    && rm -rf /var/lib/apt/lists/* \
-    && python3.10 -m venv /opt/rtx-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
     && python -m pip install pip==25.1.1 setuptools==75.8.0 wheel==0.45.1
 
 RUN git config --system --add safe.directory /workspace/score_sde_pytorch
@@ -36,15 +37,25 @@ RUN python -m pip install -r /tmp/requirements.rtx.txt \
     && mkdir -p /opt/score-sde-rtx-environment \
     && python -m pip freeze > /opt/score-sde-rtx-environment/requirements.lock.txt
 
-# Dockerfile.rtx.dockerignore restricts the context to code and requirements.
+# Both GPU images use the repository's shared .dockerignore.
 COPY . /workspace/score_sde_pytorch
-RUN mkdir -p "$TFDS_DATA_DIR" "$TORCH_EXTENSIONS_DIR" "$XDG_CACHE_HOME" \
-    && python -m py_compile main.py run_lib.py endpoint_denoise_eval.py \
-       tools/rtx_cifar_smoke.py \
+
+RUN mkdir -p "$TFDS_DATA_DIR" "$TORCH_EXTENSIONS_DIR" "$XDG_CACHE_HOME"
+
+# Install the same pinned official source as in the H200 image.
+RUN bash tools/install_official_edm.sh
+
+RUN python -m py_compile main.py run_lib.py sde_lib.py edm_lib.py \
+    artifact_utils.py reproducibility.py utils.py datasets.py evaluation.py \
+    losses.py sampling.py models/ema.py models/edm.py models/edm_canonical.py \
+    endpoint_denoise_eval.py \
     && python -c "import torch, torchvision, tensorflow, tensorflow_datasets, tensorflow_gan, tensorflow_hub, tensorflow_probability; import run_lib; print('RTX image imports OK; torch CUDA:', torch.version.cuda)" \
     && python baseline_validation.py \
+    && python canonical_edm_validation.py \
+    && python reproducibility_validation.py \
     && python checkpoint_validation.py \
     && python artifact_validation.py \
+    && if [ -f tests/test_fox_sde.py ]; then python -m unittest tests.test_fox_sde; fi \
     && python -m pytest -q tests/test_endpoint_denoise_sampling.py
 
 CMD ["/bin/bash"]
