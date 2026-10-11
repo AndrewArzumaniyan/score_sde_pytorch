@@ -1,0 +1,21 @@
+# A separate build context policy for RTX; excludes data/checkpoints/logs.
+**
+!Dockerfile
+!Dockerfile.rtx
+!requirements.txt
+!*.py
+!docker/
+!docker/requirements.rtx.txt
+!configs/
+!configs/**
+!models/
+!models/**
+!op/
+!op/**
+!tools/
+!tools/*.sh
+!tools/*.py
+!tests/
+!tests/**
+**/__pycache__/
+**/*.pyc

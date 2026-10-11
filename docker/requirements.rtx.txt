@@ -1,0 +1,18 @@
+# Python 3.10. Torch/torchvision are installed separately from the cu128 index.
+absl-py==1.4.0
+ml-collections==0.1.1
+ninja==1.11.1.1
+numpy==1.26.4
+scipy==1.11.4
+matplotlib==3.8.4
+protobuf==3.20.3
+tensorboard==2.15.2
+tensorflow-cpu==2.15.1
+tensorflow-datasets==4.9.3
+tensorflow-metadata==1.14.0
+tensorflow-gan==2.0.0
+tensorflow-hub==0.15.0
+tensorflow-probability==0.23.0
+Pillow==10.4.0
+pytest==8.3.5
+packaging==24.2

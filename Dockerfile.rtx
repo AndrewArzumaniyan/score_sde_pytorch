@@ -1,0 +1,50 @@
+# Build: docker build -f Dockerfile.rtx -t score-sde-rtx:latest .
+ARG CUDA_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+FROM ${CUDA_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TF_CPP_MIN_LOG_LEVEL=2 \
+    CUDA_HOME=/usr/local/cuda \
+    TORCH_CUDA_ARCH_LIST=12.0 \
+    MAX_JOBS=4 \
+    TFDS_DATA_DIR=/workspace/score_sde_pytorch/.tfds \
+    TORCH_EXTENSIONS_DIR=/workspace/score_sde_pytorch/.torch_extensions_rtx \
+    XDG_CACHE_HOME=/workspace/score_sde_pytorch/.cache_rtx \
+    PATH=/opt/rtx-venv/bin:${PATH}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git build-essential ninja-build \
+    python3.10 python3.10-dev python3.10-venv \
+    libglib2.0-0 libsm6 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3.10 -m venv /opt/rtx-venv \
+    && python -m pip install pip==25.1.1 setuptools==75.8.0 wheel==0.45.1
+
+RUN git config --system --add safe.directory /workspace/score_sde_pytorch
+WORKDIR /workspace/score_sde_pytorch
+
+COPY docker/requirements.rtx.txt /tmp/requirements.rtx.txt
+RUN python -m pip install -r /tmp/requirements.rtx.txt \
+    && python -m pip install \
+       --index-url https://download.pytorch.org/whl/cu128 \
+       --extra-index-url https://pypi.org/simple \
+       torch==2.7.1 torchvision==0.22.1 \
+    && python -m pip check \
+    && mkdir -p /opt/score-sde-rtx-environment \
+    && python -m pip freeze > /opt/score-sde-rtx-environment/requirements.lock.txt
+
+# Dockerfile.rtx.dockerignore restricts the context to code and requirements.
+COPY . /workspace/score_sde_pytorch
+RUN mkdir -p "$TFDS_DATA_DIR" "$TORCH_EXTENSIONS_DIR" "$XDG_CACHE_HOME" \
+    && python -m py_compile main.py run_lib.py endpoint_denoise_eval.py \
+       tools/rtx_cifar_smoke.py \
+    && python -c "import torch, torchvision, tensorflow, tensorflow_datasets, tensorflow_gan, tensorflow_hub, tensorflow_probability; import run_lib; print('RTX image imports OK; torch CUDA:', torch.version.cuda)" \
+    && python baseline_validation.py \
+    && python checkpoint_validation.py \
+    && python artifact_validation.py \
+    && python -m pytest -q tests/test_endpoint_denoise_sampling.py
+
+CMD ["/bin/bash"]
