@@ -34,6 +34,7 @@ RUN python -m pip install -r /tmp/requirements.rtx.txt \
        --extra-index-url https://pypi.org/simple \
        torch==2.7.1 torchvision==0.22.1 \
     && python -m pip check \
+    && ninja --version \
     && mkdir -p /opt/score-sde-rtx-environment \
     && python -m pip freeze > /opt/score-sde-rtx-environment/requirements.lock.txt
 

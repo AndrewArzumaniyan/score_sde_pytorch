@@ -77,6 +77,9 @@ Both builds install the same pinned official EDM source and run the H200
 validation scripts. RTX additionally checks dependency consistency, imports,
 and endpoint-denoise sampling regressions. The complete RTX package list is
 saved inside the image at `/opt/score-sde-rtx-environment/requirements.lock.txt`.
+Ninja comes from the system package `ninja-build`; its version is checked
+during the build. The duplicate Python package is omitted because pip 25.1.1
+rejects the wheel tags of `ninja==1.11.1.1` in the server build.
 Build checks run on CPU; GPU support must be checked on the server after
 building. With `run_rtx.sh`, a basic check inside the container is:
 

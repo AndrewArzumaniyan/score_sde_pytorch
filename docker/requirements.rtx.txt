@@ -1,7 +1,7 @@
 # Python 3.10. Torch/torchvision are installed separately from the cu128 index.
+# Ninja is provided by the system package ninja-build in Dockerfile.rtx.
 absl-py==1.4.0
 ml-collections==0.1.1
-ninja==1.11.1.1
 numpy==1.26.4
 scipy==1.11.4
 matplotlib==3.8.4
