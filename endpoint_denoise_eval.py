@@ -1,4 +1,4 @@
-"""Paired endpoint-denoise evaluation for the VP/FOX E4 experiment."""
+"""Paired endpoint-denoise evaluation for VP/FOX on CelebA and CIFAR-10."""
 import gc
 import logging
 import math
@@ -35,8 +35,9 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
                         checkpoint_step, training_protocol, artifact_identity,
                         extra_identity=None):
   """Generate three image outputs per trajectory and evaluate each identically."""
-  if config.data.dataset != 'CELEBA' or config.data.image_size != 64:
-    raise ValueError('E4 endpoint denoise evaluation is restricted to CelebA 64.')
+  if (config.data.dataset, config.data.image_size) not in (
+      ('CELEBA', 64), ('CIFAR10', 32)):
+    raise ValueError('Endpoint denoise evaluation supports CelebA 64 and CIFAR-10 32.')
   requested = int(config.eval.num_samples)
   batch_size = int(config.eval.batch_size)
   if requested <= 0 or batch_size <= 0:
@@ -92,7 +93,8 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
       raise ValueError(f'Incorrect E4 network evaluation count: {sample_file}')
     for variant in VARIANTS:
       image_batch = samples[f'samples_{variant}']
-      if image_batch.shape != (batch_size, 64, 64, config.data.num_channels):
+      if image_batch.shape != (batch_size, config.data.image_size,
+                               config.data.image_size, config.data.num_channels):
         raise ValueError(f'Incorrect E4 image batch shape: {sample_file}')
       if image_batch.dtype != np.uint8:
         raise ValueError(f'Incorrect E4 image dtype: {sample_file}')
