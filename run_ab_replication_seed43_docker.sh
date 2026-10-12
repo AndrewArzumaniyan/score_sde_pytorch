@@ -42,6 +42,15 @@ done
 
 # Pin the installed image by ID for this invocation. Do not pull or rebuild it.
 image_id="$(docker image inspect --format '{{.Id}}' score-sde-h200)"
+# runc cannot create missing nested bind targets after the parent source mount
+# becomes read-only. Prepare empty directory mountpoints before docker run.
+# This changes no runtime files; writable content comes from the bind mounts.
+mkdir -p "$frozen/celeba" "$frozen/workdirs" "$frozen/logs"
+for path in "$tfds" "$extensions" "$cache"; do
+  case "$path" in
+    "$container_root"/*) mkdir -p "$frozen/${path#"$container_root"/}" ;;
+  esac
+done
 mkdir -p "$output/logs" "$output/workdirs" \
   "$main/.tfds" "$main/.torch_extensions" "$main/.cache"
 run_id="$(date -u +%Y%m%dT%H%M%SZ)_$$"
