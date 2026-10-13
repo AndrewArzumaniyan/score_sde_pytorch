@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Server wrapper. Usage: bash run_ab_replication_seed43_docker.sh preflight GPU_ID
 # Explicit train mode starts a detached container and repeats the full preflight.
+# AB_REPLICATION_SEED=44 selects the next independent pair; default remains 43.
 set -euo pipefail
 
 mode="${1:-preflight}"
 gpu="${2:?Usage: bash run_ab_replication_seed43_docker.sh preflight|train GPU_ID}"
+seed="${AB_REPLICATION_SEED:-43}"
+case "$seed" in 43|44) ;; *) echo 'Replication seed must be 43 or 44.' >&2; exit 2 ;; esac
 case "$mode" in preflight|train) ;; *) echo 'Expected preflight or train.' >&2; exit 2 ;; esac
 [[ "$gpu" =~ ^[0-9]+$ || "$gpu" == GPU-* ]] || {
   echo 'GPU_ID must be a physical GPU index or GPU UUID.' >&2; exit 2; }
@@ -13,7 +16,7 @@ bundle_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 base="${AB_REPLICATION_SERVER_BASE:-/home/e.nuzhin/kovshov-arzumanyan}"
 main="$base/score_sde_pytorch"
 frozen="$base/score_sde_pytorch_ab_frozen"
-output="$base/ab_replication_seed43"
+output="$base/ab_replication_seed${seed}"
 launcher="$bundle_dir/run_ab_replication_train.sh"
 container_root=/workspace/score_sde_pytorch
 tfds="${TFDS_DATA_DIR:-$container_root/.tfds}"
@@ -31,7 +34,7 @@ for path in "$frozen/third_party" "$main/celeba/img_align_celeba"; do
   [[ -d "$path" ]] || { echo "Missing required directory: $path" >&2; exit 1; }
 done
 for arm in A_vp_pvp B_vp_pfox; do
-  target="$output/workdirs/celeba_ab_replication_${arm}_seed43_200k"
+  target="$output/workdirs/celeba_ab_replication_${arm}_seed${seed}_200k"
   [[ ! -e "$target" && ! -L "$target" ]] || {
     echo "Fresh replication requires an absent workdir: $target" >&2; exit 1; }
 done
@@ -68,7 +71,7 @@ else
     > "$output/logs/docker_${run_id}_${mode}_launcher_commit.txt"
 fi
 
-args=(run --name "ab-replication-seed43-${mode}" --gpus "device=$gpu"
+args=(run --name "ab-replication-seed${seed}-${mode}" --gpus "device=$gpu"
   --ipc=host
   --mount "type=bind,src=$frozen,dst=$container_root,readonly"
   --mount "type=bind,src=$main/celeba,dst=$container_root/celeba,readonly"
@@ -85,7 +88,7 @@ args=(run --name "ab-replication-seed43-${mode}" --gpus "device=$gpu"
   --env AB_REPLICATION_SOURCE_ROOT="$container_root"
   --env AB_REPLICATION_REFERENCE_ROOT=/workspace/seed42_workdirs
   --env AB_REPLICATION_MODE="$mode"
-  --env AB_REPLICATION_SEED=43
+  --env AB_REPLICATION_SEED="$seed"
   --env TFDS_DATA_DIR="$tfds"
   --env TORCH_EXTENSIONS_DIR="$extensions"
   --env XDG_CACHE_HOME="$cache"
@@ -97,6 +100,6 @@ if [[ "$mode" == preflight ]]; then
 else
   args+=(-d)
 fi
-printf 'Mode=%s; physical GPU=%s; image=%s; results=%s\n' \
-  "$mode" "$gpu" "$image_id" "$output"
+printf 'Mode=%s; training seed=%s; physical GPU=%s; image=%s; results=%s\n' \
+  "$mode" "$seed" "$gpu" "$image_id" "$output"
 docker "${args[@]}" "$image_id" /opt/ab_replication/run_ab_replication_train.sh
