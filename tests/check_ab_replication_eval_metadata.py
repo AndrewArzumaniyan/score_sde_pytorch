@@ -29,12 +29,12 @@ def load(path, **kwargs): return json.loads(path.read_text())
 (stubs/'evaluation.py').write_text('def _get_stats_filename(config): return "assets/stats/celeba_64_0c2d89311192_stats.npz"\n')
 artifact_source=(repo/'artifact_utils.py').read_text()
 artifact=ast.parse(artifact_source)
-names={'_canonicalize','_source_fingerprint','_manifest_with_hash','build_model_manifest'}
+names={'_canonicalize','_source_fingerprint','_manifest_with_hash','build_model_manifest','build_training_manifest'}
 funcs=[n for n in artifact.body if isinstance(n,ast.FunctionDef) and n.name in names]
-(stubs/'artifact_utils.py').write_text('import hashlib, json, math, os\nclass NP:\n generic=type("Generic",(),{})\nnp=NP()\n'+'\n\n'.join(ast.get_source_segment(artifact_source,fn) for fn in funcs)+'\n'+f'def _environment_manifest(): return {environment!r}\n')
+(stubs/'artifact_utils.py').write_text('import hashlib, json, math, os\nTRAINING_MANIFEST_SCHEMA_VERSION=1\nclass NP:\n generic=type("Generic",(),{})\nnp=NP()\n'+'\n\n'.join(ast.get_source_segment(artifact_source,fn) for fn in funcs)+'\n'+f'def _environment_manifest(): return {environment!r}\n')
 sys.path.insert(0,str(repo))
 sys.path.insert(0,str(stubs))
-from artifact_utils import _source_fingerprint, build_model_manifest
+from artifact_utils import _source_fingerprint, build_model_manifest, build_training_manifest
 from ml_collections import ConfigDict
 from configs.factorial.celeba_a_vp_pvp import get_config as get_a
 from configs.factorial.celeba_b_vp_pfox import get_config as get_b
@@ -44,14 +44,15 @@ for arm,name in [('A','A_vp_pvp'),('B','B_vp_pfox')]:
  config=(get_a if arm=='A' else get_b)()
  config.seed=43; config.training.n_iters=200000; config.training.batch_size=128
  config.training.snapshot_freq=50000; config.training.snapshot_sampling=False
- manifest={'config':config.to_dict(),'environment':environment,
- 'source_sha256':'ddf4c6acbc51b67da7a3465f2b90678ff559a628f6925d47e991350b02ff54f7','training_protocol_sha256':f'fixture-training-{arm}'}
+ manifest=build_training_manifest(config, repo_root=str(root))
+ manifest['source_sha256']='ddf4c6acbc51b67da7a3465f2b90678ff559a628f6925d47e991350b02ff54f7'
+ assert 'n_iters' not in manifest['config']['training'] and 'eval' not in manifest['config']
  state={'step':200001,'training_protocol_sha256':manifest['training_protocol_sha256'],
  'model_protocol_sha256':build_model_manifest(ConfigDict(manifest['config']))['model_protocol_sha256'],
  'checkpoint_id':f'fixture-checkpoint-{arm}'}
  manifests[arm]=(path/'run_manifest.json',manifest); states[arm]=(path/'checkpoints/checkpoint_4.pth',state)
  (path/'run_manifest.json').write_text(json.dumps(manifest)); (path/'checkpoints/checkpoint_4.pth').write_text(json.dumps(state))
-env={**os.environ,'PYTHONPATH':str(stubs),'CUDA_VISIBLE_DEVICES':'0',
+env={**os.environ,'PYTHONPATH':str(stubs)+os.pathsep+str(repo),'CUDA_VISIBLE_DEVICES':'0',
  'AB_REPLICATION_EVAL_SOURCE_SHA256':_source_fingerprint(str(root)),
  'AB_REPLICATION_EVAL_REFERENCE_SHA256':hashlib.sha256(reference.read_bytes()).hexdigest()}
 text=(repo/'run_ab_replication_eval.sh').read_text()

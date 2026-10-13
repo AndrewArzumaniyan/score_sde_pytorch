@@ -42,7 +42,7 @@ for arm, name, allocation in (
     manifest = json.loads((root / 'run_manifest.json').read_text())
     config = ConfigDict(manifest['config'])
     if (manifest['source_sha256'] != 'ddf4c6acbc51b67da7a3465f2b90678ff559a628f6925d47e991350b02ff54f7'
-            or config.seed != 43 or config.training.n_iters != 200000
+            or config.seed != 43
             or config.training.snapshot_freq != 50000
             or config.training.batch_size != 128
             or config.training.sde != 'vpsde'
@@ -75,11 +75,16 @@ cat > "$tmp_config" <<'PY'
 import json
 from pathlib import Path
 from ml_collections import ConfigDict
+from configs.factorial.celeba_a_vp_pvp import get_config as get_a
+from configs.factorial.celeba_b_vp_pfox import get_config as get_b
 
 def get_config(arm):
     name = {'A': 'A_vp_pvp', 'B': 'B_vp_pfox'}[arm]
     root = Path('/workspace/training_workdirs') / f'celeba_ab_replication_{name}_seed43_200k'
     config = ConfigDict(json.loads((root / 'run_manifest.json').read_text())['config'])
+    # Training manifests deliberately omit eval and orchestration fields.
+    config.eval = (get_a if arm == 'A' else get_b)().eval
+    config.training.n_iters = 200000
     config.sampling.time_grid = 'uniform_logsnr'
     config.sampling.logsnr_min = -10.0
     config.sampling.logsnr_max = 9.115429865459795
