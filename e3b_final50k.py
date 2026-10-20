@@ -1,4 +1,4 @@
-"""Freeze the long E3b queue and validate reuse of the existing 50k VP baseline."""
+"""Freeze six E3b splice evals; validate existing baseline metadata without generation."""
 import argparse
 import ast
 import gc
@@ -79,8 +79,8 @@ def snapshot(source, output):
     for seed in (0, 1):
         origin = source / 'workdirs' / VP / baseline_folder(seed)
         target = output / 'baselines' / f'seed{seed}'
-        (target / 'ckpt_260').mkdir(parents=True)
-        for name in ('manifest.json', 'report_260.npz', 'ckpt_260/samples_0.npz'):
+        target.mkdir(parents=True)
+        for name in ('manifest.json', 'report_260.npz'):
             shutil.copy2(str(origin / name), str(target / name))
     files = {str(path.relative_to(runtime)): digest(path)
              for path in sorted(runtime.rglob('*')) if path.is_file()}
@@ -89,7 +89,8 @@ def snapshot(source, output):
     write_json(output / 'identity/snapshot.json', dict(
         source_sha256=before, runtime_files=files, baseline_files=baselines, inputs=inputs,
         seeds=[0, 1], routes=['head:-3.3', 'full', 'tail:-3.3'], num_samples=50000,
-        batch_size=512, checkpoint=260, nfe=1001, endpoint=10.575749165617202))
+        batch_size=512, checkpoint=260, nfe=1001, endpoint=10.575749165617202,
+        baseline_validation='metadata_only', baseline_generation=False))
     print(f'Frozen source: {before}; six 50k cells, sampling seeds 0/1.', flush=True)
 
 
@@ -116,7 +117,6 @@ def preflight():
         raise RuntimeError('Expected exactly one visible CUDA GPU.')
     torch.cuda.init()
     from artifact_utils import _environment_manifest
-    from reproducibility import derive_seed
     saved = check()
     environment = _environment_manifest()
     identities = {}
@@ -156,39 +156,14 @@ def preflight():
                     or int(report['checkpoint_step']) != 1300002 or int(report['num_samples']) != 50000
                     or int(report['nfe']) != 1001 or str(report['dataset_stats_id']) != REFERENCE_SHA):
                 raise RuntimeError('Existing VP baseline checkpoint/reference/count mismatch.')
-        with np.load(str(folder / 'ckpt_260/samples_0.npz')) as sample:
-            if (str(sample['checkpoint_id']) != identities[VP] or int(sample['round_id']) != 0
-                    or int(sample['sampling_seed']) != derive_seed(seed, 'sampling-round', 0)
-                    or int(sample['nfe']) != 1001):
-                raise RuntimeError('Existing VP baseline first batch identity mismatch.')
     write_json('logs/final50k_preflight.json', dict(status='passed', source_sha256=saved['source_sha256'],
                                                  checkpoint_ids=identities, environment=environment))
     print('Preflight passed: pinned source, checkpoints, reference, baseline protocols and environment.', flush=True)
 
 
-def eval_folder(seed, route, smoke=False):
+def eval_folder(seed, route):
     suffix = route.replace(':', '')
-    tag, count = ('final50k_identity', 512) if smoke else ('final50k', 50000)
-    return ROOT / 'workdirs' / VP / f'eval_e3b_splice_{tag}_{suffix}_ckpt260_nfe1000_{count}samples_batch512_seed{seed}'
-
-
-def identity(seed):
-    import numpy as np
-    existing = BASELINES / f'seed{seed}' / 'ckpt_260/samples_0.npz'
-    smoke = eval_folder(seed, 'none', smoke=True) / 'ckpt_260/samples_0.npz'
-    with np.load(str(existing)) as baseline, np.load(str(smoke)) as actual:
-        for key in ('checkpoint_id', 'checkpoint_step', 'sampling_seed', 'round_id', 'nfe'):
-            if not np.array_equal(baseline[key], actual[key]):
-                raise RuntimeError(f'VP baseline identity mismatch: {key}')
-        if int(actual['splice_vp_calls']) != 1001 or int(actual['splice_fox_calls']) != 0:
-            raise RuntimeError('None route did not use VP on all 1001 calls.')
-        for variant in VARIANTS:
-            key = f'samples_{variant}'
-            if (actual[key].shape != (512, 64, 64, 3) or actual[key].dtype != np.uint8
-                    or not np.array_equal(baseline[key], actual[key])):
-                raise RuntimeError(f'Existing VP baseline differs at seed {seed}, {variant}; long queue stopped.')
-    write_json(f'logs/identity_seed{seed}.json', dict(status='passed', seed=seed, exact_uint8_identity=True))
-    print(f'Existing 50k VP baseline accepted: exact first-batch identity on all outputs, seed {seed}.', flush=True)
+    return ROOT / 'workdirs' / VP / f'eval_e3b_splice_final50k_{suffix}_ckpt260_nfe1000_50000samples_batch512_seed{seed}'
 
 
 def report(seed, route):
@@ -217,7 +192,7 @@ def report(seed, route):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('snapshot', 'preflight', 'check', 'identity', 'report'))
+    parser.add_argument('mode', choices=('snapshot', 'preflight', 'check', 'report'))
     parser.add_argument('arguments', nargs='*')
     args = parser.parse_args()
     if args.mode == 'snapshot':
@@ -229,15 +204,11 @@ def main():
             parser.error('unexpected arguments')
         (preflight if args.mode == 'preflight' else check)()
     else:
-        count = 1 if args.mode == 'identity' else 2
-        if len(args.arguments) != count or args.arguments[0] not in ('0', '1'):
+        if len(args.arguments) != 2 or args.arguments[0] not in ('0', '1'):
             parser.error('expected sampling seed 0/1 and a route for report')
-        if args.mode == 'identity':
-            identity(int(args.arguments[0]))
-        else:
-            if args.arguments[1] not in ('full', 'head:-3.3', 'tail:-3.3'):
-                parser.error('unexpected route')
-            report(int(args.arguments[0]), args.arguments[1])
+        if args.arguments[1] not in ('full', 'head:-3.3', 'tail:-3.3'):
+            parser.error('unexpected route')
+        report(int(args.arguments[0]), args.arguments[1])
 
 
 if __name__ == '__main__':

@@ -11,14 +11,8 @@ export E3B_SPLICE_VP_WORKDIR=workdirs/celeba_vp_continuous_50k
 export E3B_SPLICE_FOX_WORKDIR=workdirs/celeba_fox_matern32_kappa1000_50k
 printf 'preflight\n' > logs/final50k.state
 python -u e3b_final50k.py preflight
-# Reuse old 50k VP only if its first full batch matches all three outputs.
-# Both checks finish before any of the long cells starts.
-for seed in 0 1; do
-  printf 'identity_seed%s\n' "$seed" > logs/final50k.state
-  E3B_SPLICE_RUNS=none E3B_SPLICE_SEED="$seed" E3B_SPLICE_RUN_TAG=final50k_identity \
-    E3B_SPLICE_NUM_SAMPLES=512 bash run_e3b_splice_eval.sh 2>&1 | tee "logs/identity_seed${seed}.log"
-  python -u e3b_final50k.py identity "$seed"
-done
+# Existing 50k baselines are used through their metadata/reports.
+# Generate only the six requested splice cells; no VP identity smoke runs.
 # Primary head/full contrasts on both seeds precede the complementary tail.
 for cell in '0 head:-3.3' '0 full' '1 head:-3.3' '1 full' '0 tail:-3.3' '1 tail:-3.3'; do
   read -r seed route <<< "$cell"
