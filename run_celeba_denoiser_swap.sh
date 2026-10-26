@@ -49,11 +49,13 @@ if [[ "${1:-}" != _container ]]; then
   for path in "${inputs[@]}" sampling.py splice_model.py "$launcher"; do
     [[ -s "$path" ]] || { echo "Missing input: $path" >&2; exit 1; }
   done
-  git ls-files --error-unmatch "$launcher" >/dev/null
   printf '%s  %s\n' 66f3e831815ccebf90fe477348fcd0de92e5d966b7ed1eef77dc80fab72b6327 "$reference" | sha256sum -c -
   mkdir -p "$output/runtime" "$output/results" "$main/.tfds" "$main/.torch_extensions" "$main/.cache"
   git ls-files -z -- '*.py' '*.sh' '*.c' '*.cc' '*.cpp' '*.cu' '*.cuh' '*.h' Dockerfile requirements.txt \
     | tar --null -T - -cf - | tar -xf - -C "$output/runtime"
+  # fetch + restore --worktree can deliver this launcher outside HEAD/index.
+  # Freeze its actual on-disk contents explicitly, including in that case.
+  cp -- "$launcher" "$output/runtime/$launcher"
   mkdir -p "$output/runtime/assets/stats" "$output/runtime/workdirs"
   cp "$reference" "$output/runtime/$reference"
   for arm in celeba_vp_continuous_50k celeba_fox_matern32_kappa1000_50k; do
