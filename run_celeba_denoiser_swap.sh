@@ -27,10 +27,11 @@ if [[ "${1:-}" != _container ]]; then
   name=celeba-denoiser-swap-10k-seeds01
   if [[ "$plan" == next15h ]]; then
     output="$(realpath -m "${NFE_AB_OUTPUT:-$(dirname "$main")/celeba_nfe_ab_15h_20261027}")"
-    name=celeba-nfe-ab-15h-seed0
+    name="${NFE_AB_CONTAINER:-celeba-nfe-ab-15h-seed0}"
     native_baseline="${NFE_AB_NATIVE_BASELINE:-$(dirname "$main")/celeba_denoiser_swap_10k/results}"
     ab_root="${NFE_AB_SEED43_ROOT:-$(dirname "$main")/ab_replication_seed43}"
   fi
+  [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo "Invalid container name: $name" >&2; exit 2; }
   case "$output/" in "$main/"*|/) echo 'Output must be outside the source repository.' >&2; exit 2 ;; esac
   [[ ! -e "$output" ]] || { echo "Output exists: $output; inspect/resume the original container." >&2; exit 1; }
   if docker inspect "$name" >/dev/null 2>&1; then
@@ -638,7 +639,7 @@ def self_test():
     finally:
         BASELINES = saved_baselines
     baseline_self_test()
-    print('PASS: raw NFE/routes; E4/E3b control equivalence; endpoint/pairing/Tweedie; float/cache; controlled routes/manifest seed checks.')
+    print('PASS: raw NFE/routes; E4/E3b control equivalence; endpoint/pairing/Tweedie; float/cache; controlled routes; legacy report/manifest seed checks.')
 
 
 def check_environment(manifest, label):
@@ -679,10 +680,10 @@ def audit_baseline(folder, config, identity, checkpoint, native=False, alternate
     expected = dict(protocol_sha256=protocol, checkpoint_id=identity['checkpoint_id'],
                     checkpoint_step=identity['checkpoint_step'],
                     training_protocol_sha256=identity['training_protocol_sha256'],
-                    num_samples=COUNT, sampling_seed=0, dataset_stats_id=REFERENCE_SHA)
+                    num_samples=COUNT, dataset_stats_id=REFERENCE_SHA)
     variants = VARIANTS if native else ('x_mean', 'x_t', 'tweedie_xt')
     if native:
-        expected.update(alt_checkpoint_id=alternate['checkpoint_id'],
+        expected.update(sampling_seed=0, alt_checkpoint_id=alternate['checkpoint_id'],
                         alt_checkpoint_step=alternate['checkpoint_step'],
                         alt_training_protocol_sha256=alternate['training_protocol_sha256'],
                         trajectory_nfe=1000, nfe_per_output=1001)
@@ -697,8 +698,15 @@ def audit_baseline(folder, config, identity, checkpoint, native=False, alternate
     path = folder / f'report_{checkpoint}.npz'
     keys = tuple(f'{metric}_{v}' for v in variants for metric in ('IS', 'fid', 'kid'))
     report = read_archive(path, expected, keys)
+    # Historical endpoint_denoise_eval reports have no sampling_seed array.
+    # Their protocol_sha256 binds them to the manifest whose seed was checked above.
+    # Native swap reports require the array; reject conflicting values in either format.
+    if 'sampling_seed' in report and not np.array_equal(report['sampling_seed'], np.asarray(0)):
+        raise ValueError(f'Cached artifact has wrong sampling_seed: {path}')
     return dict(metrics={k: float(report[k]) for k in keys},
                 protocol_sha256=protocol, source_sha256=manifest['source_sha256'],
+                sampling_seed=0,
+                sampling_seed_source='manifest_and_report' if 'sampling_seed' in report else 'manifest_protocol_hash',
                 manifest_sha256=digest(manifest_path), report_sha256=digest(path))
 
 
@@ -716,14 +724,18 @@ def baseline_self_test():
         manifest = build_eval_manifest(cfg)
         (folder / 'manifest.json').write_text(json.dumps(manifest))
         arrays = dict(identity, protocol_sha256=manifest['protocol_sha256'],
-                      num_samples=COUNT, sampling_seed=0, dataset_stats_id=REFERENCE_SHA, nfe=1001)
+                      num_samples=COUNT, dataset_stats_id=REFERENCE_SHA, nfe=1001)
         arrays.update({f'{metric}_{v}': 1.0 for v in ('x_mean', 'x_t', 'tweedie_xt')
                        for metric in ('IS', 'fid', 'kid')})
         path = folder / 'report_4.npz'
         atomic_savez(str(path), **arrays)
-        audit_baseline(folder, cfg, identity, 4)
+        audited = audit_baseline(folder, cfg, identity, 4)
+        assert audited['sampling_seed_source'] == 'manifest_protocol_hash'
+        atomic_savez(str(path), overwrite=True, **dict(arrays, sampling_seed=0))
+        audited = audit_baseline(folder, cfg, identity, 4)
+        assert audited['sampling_seed_source'] == 'manifest_and_report'
         for wrong_key, wrong_value in (('num_samples', 5000), ('dataset_stats_id', 'other-reference'),
-                                        ('nfe', 2001), ('checkpoint_step', 100001)):
+                                        ('nfe', 2001), ('checkpoint_step', 100001), ('sampling_seed', 1)):
             atomic_savez(str(path), overwrite=True, **dict(arrays, **{wrong_key: wrong_value}))
             try:
                 audit_baseline(folder, cfg, identity, 4)
@@ -731,6 +743,20 @@ def baseline_self_test():
                 pass
             else:
                 raise AssertionError(f'Incompatible baseline accepted: {wrong_key}')
+        # Even without a report seed, a self-consistent manifest/report pair with
+        # another sampling seed must be rejected before any generation.
+        wrong_cfg = ConfigDict(cfg.to_dict())
+        wrong_cfg.eval.sampling_seed = 1
+        wrong_manifest = build_eval_manifest(wrong_cfg)
+        (folder / 'manifest.json').write_text(json.dumps(wrong_manifest))
+        atomic_savez(str(path), overwrite=True,
+                     **dict(arrays, protocol_sha256=wrong_manifest['protocol_sha256']))
+        try:
+            audit_baseline(folder, cfg, identity, 4)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('Legacy baseline with wrong manifest sampling seed accepted.')
 
 
 NEXT_QUEUE = (('native', 'vp', 2000), ('native', 'tail', 2000),
