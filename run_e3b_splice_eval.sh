@@ -8,13 +8,14 @@ ALT_CHECKPOINT="${E3B_SPLICE_ALT_CKPT:-260}"
 NUM_SAMPLES="${E3B_SPLICE_NUM_SAMPLES:-10000}"
 BATCH_SIZE="${E3B_SPLICE_BATCH_SIZE:-512}"
 SEED="${E3B_SPLICE_SEED:-0}"
+STEPS="${E3B_SPLICE_STEPS:-1000}"
 RUN_TAG="${E3B_SPLICE_RUN_TAG:-v1}"
 VP_WORKDIR="${E3B_SPLICE_VP_WORKDIR:-workdirs/celeba_vp_continuous_50k}"
 FOX_WORKDIR="${E3B_SPLICE_FOX_WORKDIR:-workdirs/celeba_fox_matern32_kappa1000_50k}"
-for value in "$CHECKPOINT" "$ALT_CHECKPOINT" "$NUM_SAMPLES" "$BATCH_SIZE" "$SEED"; do
+for value in "$CHECKPOINT" "$ALT_CHECKPOINT" "$NUM_SAMPLES" "$BATCH_SIZE" "$SEED" "$STEPS"; do
   [[ "$value" =~ ^[0-9]+$ ]] || { echo "Numeric settings must be nonnegative integers" >&2; exit 2; }
 done
-(( NUM_SAMPLES > 0 && BATCH_SIZE > 0 )) || { echo "Samples and batch size must be positive" >&2; exit 2; }
+(( NUM_SAMPLES > 0 && BATCH_SIZE > 0 && STEPS > 0 )) || { echo "Samples, batch size and steps must be positive" >&2; exit 2; }
 [[ "$RUN_TAG" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "Invalid run tag" >&2; exit 2; }
 [[ -f "$VP_WORKDIR/checkpoints/checkpoint_$CHECKPOINT.pth" ]] || { echo "Missing VP checkpoint" >&2; exit 1; }
 [[ -f "$FOX_WORKDIR/checkpoints/checkpoint_$ALT_CHECKPOINT.pth" ]] || { echo "Missing FOX checkpoint" >&2; exit 1; }
@@ -47,6 +48,7 @@ def get_config(name):
   vp.sampling.logsnr_min = -10.0
   vp.sampling.logsnr_max = 10.575749165617202
   vp.sampling.noise_removal = True
+  vp.sampling.probability_flow = False
   vp.eval.endpoint_denoise_variants = True
   vp.eval.splice_enabled = True
   vp.eval.splice_mode = mode
@@ -72,8 +74,8 @@ for spec in $RUNS; do
     config_name="$mode"
     folder_mode="$mode"
   fi
-  folder="eval_e3b_splice_${RUN_TAG}_${folder_mode}_ckpt${CHECKPOINT}_nfe1000_${NUM_SAMPLES}samples_batch${BATCH_SIZE}_seed${SEED}"
-  echo "=== E3b $spec: VP ckpt=$CHECKPOINT, FOX ckpt=$ALT_CHECKPOINT, samples=$NUM_SAMPLES ==="
+  folder="eval_e3b_splice_${RUN_TAG}_${folder_mode}_ckpt${CHECKPOINT}_nfe${STEPS}_${NUM_SAMPLES}samples_batch${BATCH_SIZE}_seed${SEED}"
+  echo "=== E3b $spec: VP ckpt=$CHECKPOINT, FOX ckpt=$ALT_CHECKPOINT, samples=$NUM_SAMPLES, $STEPS EM steps + 1 endpoint call ==="
   python -u main.py \
     --mode=eval --config="$TMP_CONFIG:$config_name" \
     --workdir="$VP_WORKDIR" --eval_folder="$folder" \
@@ -84,7 +86,7 @@ for spec in $RUNS; do
     --config.eval.enable_loss=False \
     --config.eval.enable_sampling=True \
     --config.eval.enable_bpd=False \
-    --config.eval.sampling_num_scales=1000 \
+    --config.eval.sampling_num_scales="$STEPS" \
     --config.eval.sampling_seed="$SEED" \
     --config.sampling.method=pc \
     --config.sampling.predictor=euler_maruyama \
