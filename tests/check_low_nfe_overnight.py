@@ -101,7 +101,7 @@ class QueueChecks(unittest.TestCase):
                                  env=dict(env, E3B_SPLICE_STEPS='0'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.assertNotEqual(invalid.returncode, 0)
 
-    def run_queue(self, fail=''):
+    def run_queue(self, fail='', profile='em', cells=None):
         binary, output = self.root / 'bin', self.root / 'output'
         binary.mkdir()
         (output / 'logs').mkdir(parents=True)
@@ -111,11 +111,15 @@ class QueueChecks(unittest.TestCase):
         python = binary / 'python'
         python.write_text('''#!/bin/bash
 set -eu
-cat >/dev/null
+[[ "$2" != - ]] || cat >/dev/null
 mode="$3"
 echo "meta $mode ${*:4}" >> "$CALLS"
 [[ "$FAIL_AT" != "$mode" ]] || exit 7
 if [[ "$mode" == plan ]]; then cat "$PLAN"; fi
+if [[ "$mode" == run ]]; then
+  echo "eval ${*:4}" >> "$CALLS"
+  [[ "$FAIL_AT" != "$4:$5:$6" ]]
+fi
 ''')
         python.chmod(0o755)
         (self.root / 'run_e3b_splice_eval.sh').write_text('''#!/bin/bash
@@ -124,10 +128,11 @@ echo "eval $E3B_SPLICE_STEPS $E3B_SPLICE_SEED $E3B_SPLICE_RUNS $E3B_SPLICE_NUM_S
 [[ "$FAIL_AT" != "$E3B_SPLICE_STEPS:$E3B_SPLICE_SEED:$E3B_SPLICE_RUNS" ]]
 ''')
         plan = self.root / 'plan'
-        plan.write_text(''.join('{} {} {}\n'.format(*cell) for cell in meta['CELLS']))
+        plan.write_text(''.join(' '.join(map(str, cell)) + '\n' for cell in (cells or meta['CELLS'])))
         calls = self.root / 'calls'
         env = dict(os.environ, PATH=str(binary) + ':' + os.environ['PATH'],
-                   CALLS=str(calls), PLAN=str(plan), FAIL_AT=fail, CUDA_VISIBLE_DEVICES='0')
+                   CALLS=str(calls), PLAN=str(plan), FAIL_AT=fail, CUDA_VISIBLE_DEVICES='0',
+                   CELEBA_QUEUE_PROFILE=profile)
         result = subprocess.run(['bash', str(self.root / LAUNCHER.name), '_container'], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         return result, calls.read_text().splitlines(), output

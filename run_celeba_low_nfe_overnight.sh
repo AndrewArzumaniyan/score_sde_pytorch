@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Host: bash run_celeba_low_nfe_overnight.sh GPU_ID
 # CPU-only local checks: CELEBA_LOW_NFE_IMAGE=IMAGE bash ... --check
+# Controlled A/B with Heun and DPM++: bash ... --ode GPU_ID|--check
 set -euo pipefail
 
 metadata() {
+if [[ "${CELEBA_QUEUE_PROFILE:-em}" == ode ]]; then
+  python -u celeba_ode_eval.py "$@"
+  return
+fi
 python -u - "$@" <<'PY_LOW_NFE'
 import gc
 import json
@@ -14,7 +19,7 @@ import shutil
 import sys
 import time
 
-from e3b_final50k import digest, fingerprint, REFERENCE, REFERENCE_SHA, VP, FOX
+from e3b_final50k import digest, copy_runtime, verify_runtime, REFERENCE, REFERENCE_SHA, VP, FOX
 
 ROOT = Path('/workspace/score_sde_pytorch')
 OUTPUT = Path('/output')
@@ -35,23 +40,8 @@ def write(path, value):
 
 def snapshot(source, output):
     source, output = Path(source), Path(output)
-    before = fingerprint(source)
     runtime = output / 'runtime'
-    runtime.mkdir()
-    ignored = {'.git', '__pycache__', '.cache', '.tfds', '.torch_extensions',
-               'figures', 'notes', 'tests', 'workdirs'}
-    suffixes = ('.py', '.sh', '.c', '.cc', '.cpp', '.cu', '.cuh', '.h')
-    for current, directories, files in os.walk(str(source)):
-        directories[:] = sorted(d for d in directories if d not in ignored)
-        for name in files:
-            if not name.endswith(suffixes) and name not in ('Dockerfile', 'requirements.txt'):
-                continue
-            path = Path(current) / name
-            target = runtime / path.relative_to(source)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(path), str(target))
-    if before != fingerprint(source) or before != fingerprint(runtime):
-        raise RuntimeError('Source changed during snapshot or runtime is incomplete.')
+    before = copy_runtime(source, runtime)
     for directory in ('logs', 'workdirs', 'celeba', 'assets/stats'):
         (runtime / directory).mkdir(parents=True, exist_ok=True)
     if digest(source / REFERENCE) != REFERENCE_SHA:
@@ -79,11 +69,7 @@ def snapshot(source, output):
 
 def check():
     saved = json.loads((PIN / 'snapshot.json').read_text())
-    if fingerprint(ROOT) != saved['source_sha256']:
-        raise RuntimeError('Frozen Python/CUDA source fingerprint changed.')
-    for relative, expected in dict(saved['runtime_files'], **saved['inputs']).items():
-        if digest(ROOT / relative) != expected:
-            raise RuntimeError('Pinned input changed: ' + relative)
+    verify_runtime(ROOT, saved['source_sha256'], saved['runtime_files'], saved['inputs'])
     return saved
 
 
@@ -219,37 +205,81 @@ if [[ "${1:-}" == _container ]]; then
   export E3B_SPLICE_ALLOW_TF32=True E3B_SPLICE_CUDNN_BENCHMARK=True
   export E3B_SPLICE_VP_WORKDIR=workdirs/celeba_vp_continuous_50k
   export E3B_SPLICE_FOX_WORKDIR=workdirs/celeba_fox_matern32_kappa1000_50k
-  while read -r steps seed route; do
+  while read -r steps seed route method; do
     metadata check
-    printf 'n%s_seed%s_%s\n' "$steps" "$seed" "$route" > /output/logs/queue.state
-    echo "=== Low NFE: steps=$steps seed=$seed route=$route; $(date -u -Is) ==="
-    E3B_SPLICE_RUNS="$route" E3B_SPLICE_STEPS="$steps" E3B_SPLICE_SEED="$seed" \
-      E3B_SPLICE_RUN_TAG=lownfe20261029 bash run_e3b_splice_eval.sh \
-      2>&1 | tee "/output/logs/n${steps}_seed${seed}_${route/:/}.log"
-    metadata report "$steps" "$seed" "$route"
+    cell="${method:+${method}_}n${steps}_seed${seed}_${route}"
+    printf '%s\n' "$cell" > /output/logs/queue.state
+    echo "=== Low NFE: $cell; $(date -u -Is) ==="
+    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == ode ]]; then
+      metadata run "$steps" "$seed" "$route" "$method" \
+        2>&1 | tee "/output/logs/${method}_n${steps}_train${seed}_${route}.log"
+      metadata report "$steps" "$seed" "$route" "$method"
+    else
+      E3B_SPLICE_RUNS="$route" E3B_SPLICE_STEPS="$steps" E3B_SPLICE_SEED="$seed" \
+        E3B_SPLICE_RUN_TAG=lownfe20261029 bash run_e3b_splice_eval.sh \
+        2>&1 | tee "/output/logs/n${steps}_seed${seed}_${route/:/}.log"
+      metadata report "$steps" "$seed" "$route"
+    fi
   done < /output/logs/plan.tsv
   printf 'completed\n' > /output/logs/queue.state
   echo "Low-NFE queue completed at $(date -u -Is)"
   exit
 fi
 
-[[ $# == 1 ]] || { echo 'Usage: bash run_celeba_low_nfe_overnight.sh GPU_ID|--check' >&2; exit 2; }
+if [[ "${1:-}" == --ode ]]; then export CELEBA_QUEUE_PROFILE=ode; shift; fi
+profile="${CELEBA_QUEUE_PROFILE:-em}"
+[[ "$profile" == em || "$profile" == ode ]] || { echo 'Unknown queue profile.' >&2; exit 2; }
+[[ $# == 1 ]] || { echo 'Usage: bash run_celeba_low_nfe_overnight.sh [--ode] GPU_ID|--check' >&2; exit 2; }
 main="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 launcher="$(basename "${BASH_SOURCE[0]}")"
 root=/workspace/score_sde_pytorch
 image="${CELEBA_LOW_NFE_IMAGE:-score-sde-h200}"
+test_file=tests/check_low_nfe_overnight.py
+if [[ "$profile" == ode ]]; then
+  image="${CELEBA_ODE_IMAGE:-$image}"
+  test_file=tests/check_celeba_ode.py
+fi
 if [[ "$1" == --check ]]; then
   exec docker run --rm --network none --cpus 2 --memory 4g \
     --mount "type=bind,src=$main,dst=$root,readonly" --workdir "$root" \
     --env PYTHONDONTWRITEBYTECODE=1 --env CUDA_VISIBLE_DEVICES= --env NVIDIA_VISIBLE_DEVICES=void \
-    --entrypoint python "$image" tests/check_low_nfe_overnight.py
+    --entrypoint python "$image" "$test_file"
 fi
 gpu="$1"
 [[ "$gpu" =~ ^[0-9]+$ || "$gpu" == GPU-* ]] || { echo 'Expected a physical GPU index or UUID.' >&2; exit 2; }
 output="$(realpath -m "${CELEBA_LOW_NFE_OUTPUT:-$(dirname "$main")/celeba_low_nfe_overnight_20261029}")"
 name="${CELEBA_LOW_NFE_CONTAINER:-celeba-low-nfe-overnight-20261029}"
+data_repo="$main"
+input_mounts=()
+checkpoint_mounts=()
+if [[ "$profile" == ode ]]; then
+  data_repo="$(realpath -e "${CELEBA_ODE_INPUT_REPO:-$main}")"
+  parent="$(dirname "$data_repo")"
+  ab43="$(realpath -e "${CELEBA_ODE_SEED43_ROOT:-$parent/ab_replication_seed43}")"
+  ab44="$(realpath -e "${CELEBA_ODE_SEED44_ROOT:-$parent/ab_replication_seed44}")"
+  output="$(realpath -m "${CELEBA_ODE_OUTPUT:-$parent/celeba_controlled_ode_20261031}")"
+  name="${CELEBA_ODE_CONTAINER:-celeba-controlled-ode-20261031}"
+  input_mounts=(--mount "type=bind,src=$data_repo,dst=/inputs/repo,readonly"
+    --mount "type=bind,src=$ab43,dst=/inputs/seed43,readonly"
+    --mount "type=bind,src=$ab44,dst=/inputs/seed44,readonly")
+  for seed in 42 43 44; do
+    for label in A_vp_pvp B_vp_pfox; do
+      if [[ "$seed" == 42 ]]; then
+        origin="$data_repo"; work="celeba_factorial_${label}_50k"; ckpt=40
+      else
+        origin="$ab43"; [[ "$seed" != 44 ]] || origin="$ab44"
+        work="celeba_ab_replication_${label}_seed${seed}_200k"; ckpt=4
+      fi
+      for input in "$origin/workdirs/$work/checkpoints/checkpoint_${ckpt}.pth" "$origin/workdirs/$work/run_manifest.json"; do
+        [[ -s "$input" ]] || { echo "Missing input: $input" >&2; exit 1; }
+      done
+      checkpoint_mounts+=(--mount "type=bind,src=$origin/workdirs/$work/checkpoints,dst=$root/workdirs/$work/checkpoints,readonly")
+    done
+  done
+fi
 [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo 'Invalid container name.' >&2; exit 2; }
 case "$output/" in "$main/"*|/) echo 'Output must be outside the source repository.' >&2; exit 2 ;; esac
+case "$output/" in "$data_repo/"*) echo 'Output must be outside the input repository.' >&2; exit 2 ;; esac
 [[ "$output" != *','* && "$main" != *','* ]] || { echo 'Bind source paths must not contain commas.' >&2; exit 2; }
 [[ ! -e "$output" ]] || { echo "Output exists: $output; inspect the original job, do not overwrite." >&2; exit 1; }
 if docker inspect "$name" >/dev/null 2>&1; then
@@ -271,25 +301,33 @@ for pair in "$tfds|$extensions" "$tfds|$cache" "$extensions|$cache"; do
   [[ "$left" != "$right"* && "$right" != "$left"* ]] || { echo 'Cache mounts must not overlap.' >&2; exit 2; }
 done
 cd "$main"
-for path in "$launcher" run_e3b_splice_eval.sh e3b_final50k.py main.py \
-  assets/stats/celeba_64_0c2d89311192_stats.npz celeba/list_eval_partition.txt \
-  workdirs/celeba_vp_continuous_50k/checkpoints/checkpoint_260.pth \
-  workdirs/celeba_fox_matern32_kappa1000_50k/checkpoints/checkpoint_260.pth; do
+required=("$launcher" run_e3b_splice_eval.sh e3b_final50k.py main.py
+  "$data_repo/assets/stats/celeba_64_0c2d89311192_stats.npz" "$data_repo/celeba/list_eval_partition.txt")
+if [[ "$profile" == em ]]; then
+  required+=(workdirs/celeba_vp_continuous_50k/checkpoints/checkpoint_260.pth
+    workdirs/celeba_fox_matern32_kappa1000_50k/checkpoints/checkpoint_260.pth)
+else
+  required+=(celeba_ode_eval.py ode_sampling.py)
+  git ls-files --error-unmatch celeba_ode_eval.py ode_sampling.py >/dev/null
+fi
+for path in "${required[@]}"; do
   [[ -s "$path" ]] || { echo "Missing input: $path" >&2; exit 1; }
 done
-[[ -d celeba/img_align_celeba ]] || { echo 'Missing CelebA images.' >&2; exit 1; }
+[[ -d "$data_repo/celeba/img_align_celeba" ]] || { echo 'Missing CelebA images.' >&2; exit 1; }
 git ls-files --error-unmatch "$launcher" run_e3b_splice_eval.sh >/dev/null
 image_id="$(docker image inspect --format '{{.Id}}' "$image")"
 # About 14 GB of uncompressed images/features, plus runtime and filesystem overhead.
 parent="$(dirname "$output")"
 [[ -d "$parent" ]] || { echo "Output parent must exist: $parent" >&2; exit 2; }
 available="$(df -PB1 "$parent" | awk 'NR==2 {print $4}')"
-(( available >= 25 * 1024 * 1024 * 1024 )) || { echo 'Need at least 25 GiB free for this queue.' >&2; exit 1; }
+minimum_gib=25; [[ "$profile" != ode ]] || minimum_gib=40
+(( available >= minimum_gib * 1024 * 1024 * 1024 )) || { echo "Need at least $minimum_gib GiB free for this queue." >&2; exit 1; }
 mkdir "$output"
-mkdir -p "$main/.tfds" "$main/.torch_extensions" "$main/.cache"
+mkdir -p "$data_repo/.tfds" "$data_repo/.torch_extensions" "$data_repo/.cache"
 docker run --rm --network none --user "$(id -u):$(id -g)" \
   --mount "type=bind,src=$main,dst=/source,readonly" \
   --mount "type=bind,src=$output,dst=/output" --workdir /source \
+  "${input_mounts[@]}" --env CELEBA_QUEUE_PROFILE="$profile" \
   --env PYTHONDONTWRITEBYTECODE=1 --entrypoint bash "$image_id" \
   "/source/$launcher" _meta snapshot /source /output
 git rev-parse HEAD > "$output/commit.txt"
@@ -305,18 +343,22 @@ args=(run -d --name "$name" --gpus "device=$gpu" --ipc=host
   --mount "type=bind,src=$output/logs,dst=$root/logs"
   --mount "type=bind,src=$output,dst=/opt/low-nfe,readonly"
   --mount "type=bind,src=$output,dst=/output"
-  --mount "type=bind,src=$main/celeba,dst=$root/celeba,readonly"
-  --mount "type=bind,src=$main/.tfds,dst=$tfds"
-  --mount "type=bind,src=$main/.torch_extensions,dst=$extensions"
-  --mount "type=bind,src=$main/.cache,dst=$cache"
+  --mount "type=bind,src=$data_repo/celeba,dst=$root/celeba,readonly"
+  --mount "type=bind,src=$data_repo/.tfds,dst=$tfds"
+  --mount "type=bind,src=$data_repo/.torch_extensions,dst=$extensions"
+  --mount "type=bind,src=$data_repo/.cache,dst=$cache"
   --workdir "$root" --env CUDA_VISIBLE_DEVICES=0 --env PYTHONDONTWRITEBYTECODE=1
+  --env CELEBA_QUEUE_PROFILE="$profile"
   --env TFDS_DATA_DIR="$tfds" --env TORCH_EXTENSIONS_DIR="$extensions" --env XDG_CACHE_HOME="$cache"
   --env TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}" --env MAX_JOBS="${MAX_JOBS:-8}"
   --entrypoint bash)
-for arm in celeba_vp_continuous_50k celeba_fox_matern32_kappa1000_50k; do
-  args+=(--mount "type=bind,src=$main/workdirs/$arm/checkpoints,dst=$root/workdirs/$arm/checkpoints,readonly")
-done
+if [[ "$profile" == em ]]; then
+  for arm in celeba_vp_continuous_50k celeba_fox_matern32_kappa1000_50k; do
+    checkpoint_mounts+=(--mount "type=bind,src=$main/workdirs/$arm/checkpoints,dst=$root/workdirs/$arm/checkpoints,readonly")
+  done
+fi
+args+=("${checkpoint_mounts[@]}")
 docker "${args[@]}" "$image_id" "$launcher" _container
 docker inspect "$name" > "$output/docker_inspect_start.json"
-printf 'Started %s on physical GPU %s. Estimated 12-16 h, not a runtime guarantee.\n' "$name" "$gpu"
+printf 'Started %s (profile=%s) on physical GPU %s. Night-sized queue; refine ETA from cell logs.\n' "$name" "$profile" "$gpu"
 printf 'Results: %s\nFollow: docker logs -f --tail 60 %s\n' "$output" "$name"

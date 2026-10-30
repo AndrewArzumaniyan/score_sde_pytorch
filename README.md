@@ -31,6 +31,49 @@ In this fork we:
 - added an EDM-preconditioned NCSN++ baseline with the EDM loss, log-normal
   noise-level distribution, Karras grid, and Algorithm 2 Heun sampler.
 
+### Controlled CelebA ODE sampler comparison
+
+`run_celeba_low_nfe_overnight.sh --ode GPU_ID` reuses the existing GPU queue,
+snapshot/cache handling, checkpoint loader and endpoint IS/FID/KID evaluator.
+The profile evaluates controlled A/B at 200k for training seeds 42/43/44,
+Heun and DPM-Solver++ 2M, 128/256 trajectory network calls, 10k images and
+sampling seed 0: 24 cells. Both methods integrate VP probability flow in
+half-log-SNR, on uniform log-SNR grids with common endpoints. Heun uses
+64/128 two-stage steps; DPM++ uses 128/256 multistep steps. Each adds one
+explicit Tweedie call (total NFE 129/257). No thresholding or extra solver
+step to zero noise is enabled. The two outputs are `x_t` and `tweedie_xt`;
+unclipped inverse-scaled float32 endpoint states are also saved.
+
+These Python changes affect the source fingerprint. Deliver the committed
+revision to a separate Git checkout/worktree, leaving active training
+sources and existing frozen runtimes untouched. Point the new checkout at
+the original data/checkpoint repository, for example on the server:
+
+```bash
+export CELEBA_ODE_INPUT_REPO=/home/e.nuzhin/kovshov-arzumanyan/score_sde_pytorch
+bash run_celeba_low_nfe_overnight.sh --ode --check &&
+bash run_celeba_low_nfe_overnight.sh --ode 3
+docker logs -f --tail 60 celeba-controlled-ode-20261031
+```
+
+The `score-sde-h200` image and one physical GPU are selected by Docker;
+inside the container `CUDA_VISIBLE_DEVICES=0`. Caller-provided container
+cache paths are preserved. The original repository provides seed42 weights,
+CelebA and shared caches; sibling `ab_replication_seed43`/`ab_replication_seed44`
+directories provide the other weights and training manifests. Overrides:
+`CELEBA_ODE_SEED43_ROOT`, `CELEBA_ODE_SEED44_ROOT`, `CELEBA_ODE_OUTPUT`,
+`CELEBA_ODE_CONTAINER`, and `CELEBA_ODE_IMAGE` (for local CPU checks).
+Default output: sibling `celeba_controlled_ode_20261031`, including
+`summary.json`, `snapshot.json`, `logs/queue.state` and per-cell artifacts.
+The launcher requires 40 GiB free, refuses existing output/container names,
+and runs strict checkpoint/EMA and small CUDA solver checks before generation.
+The summary contains points, not bootstrap confidence intervals.
+
+The EM invocation without `--ode` retains its original defaults. CPU checks
+use analytic Gaussian flows, artifact/cache fixtures and a mocked Docker;
+they do not generate real CelebA samples. Optional independent DPM++ comparison
+uses `DPM_SOLVER_REFERENCE` in the test container; no reference code is vendored.
+
 ### Cosine-VP and EDM baselines
 
 The new baselines reuse the repository's training loop, logging, checkpoints,

@@ -44,10 +44,10 @@ def baseline_folder(seed):
     return f'eval_e4_endpoint_denoise_final50k_vp_extended_ckpt260_nfe1000_50000samples_batch512_seed{seed}'
 
 
-def snapshot(source, output):
-    source, output = Path(source), Path(output)
+def copy_runtime(source, runtime):
+    """Freeze runtime sources once; shared by CelebA GPU queue profiles."""
+    source, runtime = Path(source), Path(runtime)
     before = fingerprint(source)
-    runtime = output / 'runtime'
     runtime.mkdir()  # Never overwrite an existing frozen runtime.
     ignored = {'.git', '__pycache__', '.cache', '.tfds', '.torch_extensions',
                'figures', 'notes', 'tests', 'workdirs'}
@@ -63,6 +63,24 @@ def snapshot(source, output):
             shutil.copy2(str(path), str(target))
     if before != fingerprint(source) or before != fingerprint(runtime):
         raise RuntimeError('Source changed during snapshot, or frozen source is incomplete.')
+    return before
+
+
+def verify_runtime(root, source_sha256, runtime_files, inputs):
+    """Verify a pinned runtime and its mounted inputs, without loading models."""
+    root = Path(root)
+    if fingerprint(root) != source_sha256:
+        raise RuntimeError('Frozen source fingerprint changed.')
+    for relative, expected in dict(runtime_files, **inputs).items():
+        path = root / relative
+        if digest(path) != expected:
+            raise RuntimeError('Pinned input changed: ' + relative)
+
+
+def snapshot(source, output):
+    source, output = Path(source), Path(output)
+    runtime = output / 'runtime'
+    before = copy_runtime(source, runtime)
     for directory in ('identity', 'logs', 'baselines', 'workdirs'):
         (output / directory).mkdir()
     for directory in ('logs', 'workdirs', 'celeba'):
@@ -96,17 +114,18 @@ def snapshot(source, output):
 
 def check():
     saved = json.loads((IDENTITY / 'snapshot.json').read_text())
-    if fingerprint(ROOT) != saved['source_sha256']:
-        raise RuntimeError('Frozen source fingerprint changed.')
-    for relative, expected in saved['runtime_files'].items():
-        if digest(ROOT / relative) != expected:
-            raise RuntimeError(f'Frozen runtime file changed: {relative}')
+    # Preserve the historical diagnostic while sharing the verification core.
+    try:
+        verify_runtime(ROOT, saved['source_sha256'], saved['runtime_files'], saved['inputs'])
+    except RuntimeError as error:
+        if str(error).startswith('Pinned input changed:'):
+            relative = str(error).split(': ', 1)[1]
+            if relative in saved['runtime_files']:
+                raise RuntimeError('Frozen runtime file changed: ' + relative) from error
+        raise
     for relative, expected in saved['baseline_files'].items():
         if digest(BASELINES / relative) != expected:
             raise RuntimeError(f'Frozen baseline changed: {relative}')
-    for path, expected in saved['inputs'].items():
-        if digest(path) != expected:
-            raise RuntimeError(f'Pinned checkpoint/reference changed: {path}')
     return saved
 
 
