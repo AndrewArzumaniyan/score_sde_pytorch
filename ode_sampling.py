@@ -28,9 +28,11 @@ def get_vp_ode_sampler(sde, shape, inverse_scaler, method, eps=1e-3, device='cud
   Heun takes N/2 two-stage steps, DPM++ takes N multistep steps. Both use
   uniform full-log-SNR nodes, identical finite endpoints and Gaussian prior.
   """
-  # This implementation relies on alpha^2+sigma^2=1 and excludes native FOX.
-  if type(sde) is not sde_lib.VPSDE or method not in METHODS:
-    raise ValueError('Fixed-budget ODE sampling requires a VPSDE and a supported method.')
+  # Normalize native Gaussian marginals by their deterministic overall scale.
+  # The normalized process has VP marginals, while the score is evaluated
+  # at the original native state and native time.
+  if type(sde) not in (sde_lib.VPSDE, sde_lib.FoxVPSDE) or method not in METHODS:
+    raise ValueError('Fixed-budget ODE sampling requires VP or native FOX and a supported method.')
   budget = int(sde.N)
   if budget < 2 or (method == 'ode_heun' and budget % 2):
     raise ValueError('Heun requires a positive even trajectory NFE; minimum budget is 2.')
@@ -49,8 +51,11 @@ def get_vp_ode_sampler(sde, shape, inverse_scaler, method, eps=1e-3, device='cud
     # Evaluate the network using the project's existing time/log-SNR wrapper.
     times = grid.to(dtype=x.dtype)
     ones = torch.ones((steps + 1, 1, 1, 1), device=device, dtype=x.dtype)
-    alpha, sigma = sde.marginal_prob(ones, times)
-    alpha = alpha.flatten()
+    native_alpha, native_sigma = sde.marginal_prob(ones, times)
+    native_alpha = native_alpha.flatten()
+    scale = torch.sqrt(native_alpha.square() + native_sigma.square())
+    alpha, sigma = native_alpha / scale, native_sigma / scale
+    x = x / scale[0]
     # Compute half-log-SNR from the actual coefficients; no factor-of-two ambiguity.
     half_lambda = torch.log(alpha.double()) - torch.log(sigma.double())
     if not bool(torch.all(half_lambda[1:] > half_lambda[:-1])):
@@ -62,7 +67,7 @@ def get_vp_ode_sampler(sde, shape, inverse_scaler, method, eps=1e-3, device='cud
       nonlocal calls
       calls += 1
       vec_t = torch.full((shape[0],), times[index].item(), device=device, dtype=state.dtype)
-      return score_fn(state, vec_t)
+      return scale[index] * score_fn(state * scale[index], vec_t)
 
     previous = None
     for i in range(steps):
@@ -85,6 +90,6 @@ def get_vp_ode_sampler(sde, shape, inverse_scaler, method, eps=1e-3, device='cud
     clean = (x + sigma[-1].square() * score(x, steps)) / alpha[-1]
     if calls != budget + 1 or not bool(torch.isfinite(clean).all()):
       raise RuntimeError('Incorrect ODE NFE or non-finite endpoint denoise.')
-    return dict(x_t=inverse_scaler(x), tweedie_xt=inverse_scaler(clean)), calls
+    return dict(x_t=inverse_scaler(x * scale[-1]), tweedie_xt=inverse_scaler(clean)), calls
 
   return sampler

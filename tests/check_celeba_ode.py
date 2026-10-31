@@ -118,7 +118,30 @@ class NumericalChecks(unittest.TestCase):
         with self.assertRaises(ValueError):
             ode_sampling.get_vp_ode_sampler(sde(3), (2, 1, 2, 2), lambda x: x, 'ode_heun')
         with self.assertRaises(ValueError):
-            ode_sampling.get_vp_ode_sampler(sde_lib.FoxVPSDE(), (2, 1, 2, 2), lambda x: x, 'ode_heun')
+            ode_sampling.get_vp_ode_sampler(sde_lib.VESDE(), (2, 1, 2, 2), lambda x: x, 'ode_heun')
+
+    def test_native_fox_gaussian_flow_and_tweedie(self):
+        initial = torch.linspace(-1, 1, 8, dtype=torch.float64).reshape(2, 1, 2, 2)
+        for method in ode_sampling.METHODS:
+            errors = []
+            for budget in (32, 64, 128):
+                process = sde_lib.FoxVPSDE(u=-5.0, kernel='matern32',
+                    matern_length_scale=346.4101615138, target_terminal_variance=1.0, N=budget)
+                process.sampling_logsnr_min = -10.0
+                process.sampling_logsnr_max = 10.575749165617202
+                network = GaussianEps(process)
+                grid = process.sampling_time_grid(1e-3, grid='uniform_logsnr', N=2, dtype=torch.float64)
+                a, sig = process.marginal_prob(torch.ones((2, 1, 1, 1), dtype=torch.float64), grid)
+                variance = a.flatten().square() * network.variance + sig.square()
+                exact = a[-1] * network.mean + torch.sqrt(variance[-1] / variance[0]) * (initial - a[0] * network.mean)
+                outputs, nfe = ode_sampling.get_vp_ode_sampler(process, initial.shape, lambda x: x, method, device='cpu')(network, z=initial)
+                errors.append(float((outputs['x_t'] - exact).abs().max()))
+                endpoint_score = -network.at_time(outputs['x_t'], grid[-1:].expand(2)) / sig[-1]
+                torch.testing.assert_close(outputs['tweedie_xt'], (outputs['x_t'] + sig[-1].square() * endpoint_score) / a[-1], rtol=1e-8, atol=1e-8)
+                self.assertEqual(nfe, budget + 1)
+            self.assertGreater(errors[0] / errors[1], 2.0, (method, errors))
+            self.assertGreater(errors[1] / errors[2], 2.0, (method, errors))
+            print(method, 'native FOX Gaussian errors:', errors)
 
     @unittest.skipUnless(os.environ.get('DPM_SOLVER_REFERENCE'), 'Optional pinned official reference not supplied')
     def test_matches_pinned_official_dpm_solver(self):

@@ -5,6 +5,10 @@
 set -euo pipefail
 
 metadata() {
+if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode ]]; then
+  python -u celeba_final_ode_eval.py "$@"
+  return
+fi
 if [[ "${CELEBA_QUEUE_PROFILE:-em}" == ode ]]; then
   python -u celeba_ode_eval.py "$@"
   return
@@ -210,7 +214,7 @@ if [[ "${1:-}" == _container ]]; then
     cell="${method:+${method}_}n${steps}_seed${seed}_${route}"
     printf '%s\n' "$cell" > /output/logs/queue.state
     echo "=== Low NFE: $cell; $(date -u -Is) ==="
-    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == ode ]]; then
+    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == ode || "${CELEBA_QUEUE_PROFILE:-em}" == final_ode ]]; then
       metadata run "$steps" "$seed" "$route" "$method" \
         2>&1 | tee "/output/logs/${method}_n${steps}_train${seed}_${route}.log"
       metadata report "$steps" "$seed" "$route" "$method"
@@ -227,8 +231,9 @@ if [[ "${1:-}" == _container ]]; then
 fi
 
 if [[ "${1:-}" == --ode ]]; then export CELEBA_QUEUE_PROFILE=ode; shift; fi
+if [[ "${1:-}" == --final-ode ]]; then export CELEBA_QUEUE_PROFILE=final_ode; shift; fi
 profile="${CELEBA_QUEUE_PROFILE:-em}"
-[[ "$profile" == em || "$profile" == ode ]] || { echo 'Unknown queue profile.' >&2; exit 2; }
+[[ "$profile" == em || "$profile" == ode || "$profile" == final_ode ]] || { echo 'Unknown queue profile.' >&2; exit 2; }
 [[ $# == 1 ]] || { echo 'Usage: bash run_celeba_low_nfe_overnight.sh [--ode] GPU_ID|--check' >&2; exit 2; }
 main="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 launcher="$(basename "${BASH_SOURCE[0]}")"
@@ -238,6 +243,10 @@ test_file=tests/check_low_nfe_overnight.py
 if [[ "$profile" == ode ]]; then
   image="${CELEBA_ODE_IMAGE:-$image}"
   test_file=tests/check_celeba_ode.py
+fi
+if [[ "$profile" == final_ode ]]; then
+  image="${CELEBA_FINAL_ODE_IMAGE:-$image}"
+  test_file=tests/check_celeba_final_ode.py
 fi
 if [[ "$1" == --check ]]; then
   exec docker run --rm --network none --cpus 2 --memory 4g \
@@ -277,6 +286,17 @@ if [[ "$profile" == ode ]]; then
     done
   done
 fi
+if [[ "$profile" == final_ode ]]; then
+  data_repo="$(realpath -e "${CELEBA_FINAL_ODE_INPUT_REPO:-$main}")"
+  parent="$(dirname "$data_repo")"
+  output="$(realpath -m "${CELEBA_FINAL_ODE_OUTPUT:-$parent/celeba_final_ode_20261031}")"
+  name="${CELEBA_FINAL_ODE_CONTAINER:-celeba-final-ode-20261031}"
+  input_mounts=(--mount "type=bind,src=$data_repo,dst=/inputs/repo,readonly")
+  for arm in celeba_vp_continuous_50k celeba_fox_matern32_kappa1000_50k; do
+    [[ -s "$data_repo/workdirs/$arm/checkpoints/checkpoint_260.pth" ]] || { echo "Missing checkpoint: $arm" >&2; exit 1; }
+    checkpoint_mounts+=(--mount "type=bind,src=$data_repo/workdirs/$arm/checkpoints,dst=$root/workdirs/$arm/checkpoints,readonly")
+  done
+fi
 [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo 'Invalid container name.' >&2; exit 2; }
 case "$output/" in "$main/"*|/) echo 'Output must be outside the source repository.' >&2; exit 2 ;; esac
 case "$output/" in "$data_repo/"*) echo 'Output must be outside the input repository.' >&2; exit 2 ;; esac
@@ -306,9 +326,12 @@ required=("$launcher" run_e3b_splice_eval.sh e3b_final50k.py main.py
 if [[ "$profile" == em ]]; then
   required+=(workdirs/celeba_vp_continuous_50k/checkpoints/checkpoint_260.pth
     workdirs/celeba_fox_matern32_kappa1000_50k/checkpoints/checkpoint_260.pth)
-else
+elif [[ "$profile" == ode ]]; then
   required+=(celeba_ode_eval.py ode_sampling.py)
   git ls-files --error-unmatch celeba_ode_eval.py ode_sampling.py >/dev/null
+else
+  required+=(celeba_final_ode_eval.py ode_sampling.py)
+  git ls-files --error-unmatch celeba_final_ode_eval.py ode_sampling.py >/dev/null
 fi
 for path in "${required[@]}"; do
   [[ -s "$path" ]] || { echo "Missing input: $path" >&2; exit 1; }
@@ -321,6 +344,7 @@ parent="$(dirname "$output")"
 [[ -d "$parent" ]] || { echo "Output parent must exist: $parent" >&2; exit 2; }
 available="$(df -PB1 "$parent" | awk 'NR==2 {print $4}')"
 minimum_gib=25; [[ "$profile" != ode ]] || minimum_gib=40
+[[ "$profile" != final_ode ]] || minimum_gib=70
 (( available >= minimum_gib * 1024 * 1024 * 1024 )) || { echo "Need at least $minimum_gib GiB free for this queue." >&2; exit 1; }
 mkdir "$output"
 mkdir -p "$data_repo/.tfds" "$data_repo/.torch_extensions" "$data_repo/.cache"
