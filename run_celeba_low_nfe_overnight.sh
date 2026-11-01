@@ -3,6 +3,7 @@
 # CPU-only local checks: CELEBA_LOW_NFE_IMAGE=IMAGE bash ... --check
 # Controlled A/B with Heun and DPM++: bash ... --ode GPU_ID|--check
 # EDM ckpt-2, VP/FOX and A/B with the EDM sampler: bash ... --edm-protocol GPU_ID|--check
+# Final VP/FOX, Heun/DPM++, 16-256 calls, two seeds (10k): --final-ode-lownfe GPU_ID|--check
 set -euo pipefail
 
 metadata() {
@@ -12,6 +13,10 @@ if [[ "${CELEBA_QUEUE_PROFILE:-em}" == edm_protocol ]]; then
 fi
 if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode ]]; then
   python -u celeba_final_ode_eval.py "$@"
+  return
+fi
+if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode_lownfe ]]; then
+  python -u celeba_final_ode_lownfe_eval.py "$@"
   return
 fi
 if [[ "${CELEBA_QUEUE_PROFILE:-em}" == ode ]]; then
@@ -214,16 +219,24 @@ if [[ "${1:-}" == _container ]]; then
   export E3B_SPLICE_ALLOW_TF32=True E3B_SPLICE_CUDNN_BENCHMARK=True
   export E3B_SPLICE_VP_WORKDIR=workdirs/celeba_vp_continuous_50k
   export E3B_SPLICE_FOX_WORKDIR=workdirs/celeba_fox_matern32_kappa1000_50k
-  while read -r steps seed route method; do
+  while read -r steps seed route method sampling_seed; do
     metadata check
     cell="${method:+${method}_}n${steps}_seed${seed}_${route}"
     log="/output/logs/${method}_n${steps}_train${seed}_${route}.log"
     if [[ "${CELEBA_QUEUE_PROFILE:-em}" == edm_protocol ]]; then
       cell="${route}_ckpt${seed}_${method}_n${steps}"; log="/output/logs/${cell}.log"
     fi
+    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode_lownfe ]]; then
+      [[ "$sampling_seed" == 0 || "$sampling_seed" == 1 ]] || { echo 'Invalid sampling seed in low-NFE plan.' >&2; exit 2; }
+      cell="${method}_n${steps}_${seed}samples_${route}_seed${sampling_seed}"
+      log="/output/logs/${cell}.log"
+    fi
     printf '%s\n' "$cell" > /output/logs/queue.state
     echo "=== Low NFE: $cell; $(date -u -Is) ==="
-    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == ode || "${CELEBA_QUEUE_PROFILE:-em}" == final_ode ||
+    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode_lownfe ]]; then
+      metadata run "$steps" "$seed" "$route" "$method" "$sampling_seed" 2>&1 | tee "$log"
+      metadata report "$steps" "$seed" "$route" "$method" "$sampling_seed"
+    elif [[ "${CELEBA_QUEUE_PROFILE:-em}" == ode || "${CELEBA_QUEUE_PROFILE:-em}" == final_ode ||
           "${CELEBA_QUEUE_PROFILE:-em}" == edm_protocol ]]; then
       metadata run "$steps" "$seed" "$route" "$method" 2>&1 | tee "$log"
       metadata report "$steps" "$seed" "$route" "$method"
@@ -241,10 +254,12 @@ fi
 
 if [[ "${1:-}" == --ode ]]; then export CELEBA_QUEUE_PROFILE=ode; shift; fi
 if [[ "${1:-}" == --final-ode ]]; then export CELEBA_QUEUE_PROFILE=final_ode; shift; fi
+if [[ "${1:-}" == --final-ode-lownfe ]]; then export CELEBA_QUEUE_PROFILE=final_ode_lownfe; shift; fi
 if [[ "${1:-}" == --edm-protocol ]]; then export CELEBA_QUEUE_PROFILE=edm_protocol; shift; fi
 profile="${CELEBA_QUEUE_PROFILE:-em}"
-[[ "$profile" == em || "$profile" == ode || "$profile" == final_ode || "$profile" == edm_protocol ]] || { echo 'Unknown queue profile.' >&2; exit 2; }
-[[ $# == 1 ]] || { echo 'Usage: bash run_celeba_low_nfe_overnight.sh [--ode|--final-ode|--edm-protocol] GPU_ID|--check' >&2; exit 2; }
+[[ "$profile" == em || "$profile" == ode || "$profile" == final_ode || "$profile" == final_ode_lownfe ||
+   "$profile" == edm_protocol ]] || { echo 'Unknown queue profile.' >&2; exit 2; }
+[[ $# == 1 ]] || { echo 'Usage: bash run_celeba_low_nfe_overnight.sh [--ode|--final-ode|--final-ode-lownfe|--edm-protocol] GPU_ID|--check' >&2; exit 2; }
 main="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 launcher="$(basename "${BASH_SOURCE[0]}")"
 root=/workspace/score_sde_pytorch
@@ -257,6 +272,10 @@ fi
 if [[ "$profile" == final_ode ]]; then
   image="${CELEBA_FINAL_ODE_IMAGE:-$image}"
   test_file=tests/check_celeba_final_ode.py
+fi
+if [[ "$profile" == final_ode_lownfe ]]; then
+  image="${CELEBA_FINAL_ODE_IMAGE:-$image}"
+  test_file=tests/check_celeba_final_ode_lownfe.py
 fi
 if [[ "$profile" == edm_protocol ]]; then
   image="${CELEBA_EDM_PROTOCOL_IMAGE:-$image}"
@@ -301,11 +320,16 @@ if [[ "$profile" == ode ]]; then
     done
   done
 fi
-if [[ "$profile" == final_ode ]]; then
+if [[ "$profile" == final_ode || "$profile" == final_ode_lownfe ]]; then
   data_repo="$(realpath -e "${CELEBA_FINAL_ODE_INPUT_REPO:-$main}")"
   parent="$(dirname "$data_repo")"
-  output="$(realpath -m "${CELEBA_FINAL_ODE_OUTPUT:-$parent/celeba_final_ode_20261031}")"
-  name="${CELEBA_FINAL_ODE_CONTAINER:-celeba-final-ode-20261031}"
+  if [[ "$profile" == final_ode ]]; then
+    output="$(realpath -m "${CELEBA_FINAL_ODE_OUTPUT:-$parent/celeba_final_ode_20261031}")"
+    name="${CELEBA_FINAL_ODE_CONTAINER:-celeba-final-ode-20261031}"
+  else
+    output="$(realpath -m "${CELEBA_FINAL_ODE_LOWNFE_OUTPUT:-$parent/celeba_final_ode_lownfe_20261102}")"
+    name="${CELEBA_FINAL_ODE_LOWNFE_CONTAINER:-celeba-final-ode-lownfe-20261102}"
+  fi
   input_mounts=(--mount "type=bind,src=$data_repo,dst=/inputs/repo,readonly")
   for arm in celeba_vp_continuous_50k celeba_fox_matern32_kappa1000_50k; do
     [[ -s "$data_repo/workdirs/$arm/checkpoints/checkpoint_260.pth" ]] || { echo "Missing checkpoint: $arm" >&2; exit 1; }
@@ -377,6 +401,9 @@ elif [[ "$profile" == ode ]]; then
 elif [[ "$profile" == final_ode ]]; then
   required+=(celeba_final_ode_eval.py ode_sampling.py)
   git ls-files --error-unmatch celeba_final_ode_eval.py ode_sampling.py >/dev/null
+elif [[ "$profile" == final_ode_lownfe ]]; then
+  required+=(celeba_final_ode_lownfe_eval.py celeba_final_ode_eval.py ode_sampling.py)
+  git ls-files --error-unmatch celeba_final_ode_lownfe_eval.py celeba_final_ode_eval.py ode_sampling.py >/dev/null
 else
   required+=(celeba_edm_protocol_eval.py celeba_final_ode_eval.py celeba_ode_eval.py ode_sampling.py)
   git ls-files --error-unmatch celeba_edm_protocol_eval.py celeba_final_ode_eval.py celeba_ode_eval.py ode_sampling.py >/dev/null
@@ -387,12 +414,13 @@ done
 [[ -d "$data_repo/celeba/img_align_celeba" ]] || { echo 'Missing CelebA images.' >&2; exit 1; }
 git ls-files --error-unmatch "$launcher" run_e3b_splice_eval.sh >/dev/null
 image_id="$(docker image inspect --format '{{.Id}}' "$image")"
-# About 14 GB of uncompressed images/features, plus runtime and filesystem overhead.
+# Space for images, both endpoint outputs/states, features and runtime overhead.
 parent="$(dirname "$output")"
 [[ -d "$parent" ]] || { echo "Output parent must exist: $parent" >&2; exit 2; }
 available="$(df -PB1 "$parent" | awk 'NR==2 {print $4}')"
 minimum_gib=25; [[ "$profile" != ode ]] || minimum_gib=40
 [[ "$profile" != final_ode && "$profile" != edm_protocol ]] || minimum_gib=70
+[[ "$profile" != final_ode_lownfe ]] || minimum_gib=120
 (( available >= minimum_gib * 1024 * 1024 * 1024 )) || { echo "Need at least $minimum_gib GiB free for this queue." >&2; exit 1; }
 mkdir "$output"
 mkdir -p "$data_repo/.tfds" "$data_repo/.torch_extensions" "$data_repo/.cache"
