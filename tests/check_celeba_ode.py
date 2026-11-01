@@ -143,6 +143,59 @@ class NumericalChecks(unittest.TestCase):
             self.assertGreater(errors[1] / errors[2], 2.0, (method, errors))
             print(method, 'native FOX Gaussian errors:', errors)
 
+    def test_karras_grid_nodes_and_shared_endpoints(self):
+        for process in (sde(34), sde_lib.FoxVPSDE(u=-5.0, kernel='matern32',
+                matern_length_scale=346.4101615138, target_terminal_variance=1.0, N=34)):
+            process.sampling_logsnr_min, process.sampling_logsnr_max = -8.764053269347762, 12.429216196844383
+            grid = ode_sampling.karras_time_grid(process, 1e-3, 18, 'cpu')
+            ends = process.sampling_time_grid(1e-3, grid='uniform_logsnr', N=2, dtype=torch.float64)
+            torch.testing.assert_close(grid[[0, -1]], ends, rtol=0, atol=0)
+            ramp = torch.linspace(0, 1, 18, dtype=torch.float64)
+            expected = (80 ** (1 / 7) + ramp * (0.002 ** (1 / 7) - 80 ** (1 / 7))) ** 7
+            a, sig = process.marginal_prob(torch.ones((18, 1, 1, 1), dtype=torch.float64), grid)
+            torch.testing.assert_close(sig / a.flatten(), expected, rtol=1e-8, atol=0)
+
+    def test_edm_heun_matches_project_edm_algorithm2(self):
+        import edm_lib
+
+        class GaussianDenoiser(torch.nn.Module):
+            def __init__(self, mean=.7, variance=.4):
+                super().__init__()
+                self.mean, self.variance = mean, variance
+
+            def forward(self, x, sigma):
+                s2 = sigma.double()[:, None, None, None].square()
+                return (self.mean + self.variance / (self.variance + s2) * (x.double() - self.mean)).to(x.dtype)
+
+        process = sde(34)
+        grid = process.sampling_time_grid(1e-3, grid='uniform_logsnr', N=2, dtype=torch.float64)
+        a, sig = process.marginal_prob(torch.ones((2, 1, 1, 1), dtype=torch.float64), grid)
+        ve = (sig / a.flatten()).tolist()
+        edm = edm_lib.EDM(sigma_min=ve[1], sigma_max=ve[0], rho=7.0, s_churn=0.0, N=18)
+        shape = (2, 1, 2, 2)
+        torch.manual_seed(5)
+        expected, edm_nfe = sampling.get_edm_sampler(edm, shape, lambda x: x, device='cpu')(GaussianDenoiser())
+        torch.manual_seed(5)
+        latent = torch.randn(*shape, dtype=torch.float32).to(torch.float64) * edm.noise_levels('cpu')[0]
+        network = GaussianEps(process)
+        outputs, nfe = ode_sampling.get_vp_ode_sampler(process, shape, lambda x: x, 'ode_edm_heun',
+                                                      device='cpu')(network, z=latent * a[0])
+        self.assertEqual((nfe, edm_nfe, len(network.calls)), (35, 35, 35))
+        torch.testing.assert_close(outputs['tweedie_xt'].float(), expected, rtol=1e-4, atol=1e-4)
+        print('EDM Algorithm 2 max difference:', float((outputs['tweedie_xt'].float() - expected).abs().max()))
+
+    def test_edm_heun_grid_dispatch(self):
+        def cfg(method, grid):
+            return NS(sampling=NS(method=method, probability_flow=True, noise_removal=True,
+                corrector='none', time_grid=grid), training=NS(continuous=True),
+                eval=NS(endpoint_denoise_variants=True, endpoint_denoise_outputs=ode_sampling.VARIANTS), device='cpu')
+        self.assertTrue(callable(sampling.get_sampling_fn(cfg('ode_edm_heun', 'karras'), sde(34), (2, 1, 2, 2), lambda x: x, 1e-3)))
+        for method, grid in (('ode_edm_heun', 'uniform_logsnr'), ('ode_heun', 'karras'), ('ode_dpmpp_2m', 'karras')):
+            with self.assertRaises(ValueError):
+                sampling.get_sampling_fn(cfg(method, grid), sde(34), (2, 1, 2, 2), lambda x: x, 1e-3)
+        with self.assertRaises(ValueError):
+            ode_sampling.get_vp_ode_sampler(sde(35), (2, 1, 2, 2), lambda x: x, 'ode_edm_heun')
+
     @unittest.skipUnless(os.environ.get('DPM_SOLVER_REFERENCE'), 'Optional pinned official reference not supplied')
     def test_matches_pinned_official_dpm_solver(self):
         spec = importlib.util.spec_from_file_location('official_dpm', os.environ['DPM_SOLVER_REFERENCE'])
