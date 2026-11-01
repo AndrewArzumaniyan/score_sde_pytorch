@@ -1,0 +1,924 @@
+#!/usr/bin/env bash
+# Host: bash run_celeba_denoiser_swap.sh GPU_ID
+# Next queue: bash run_celeba_denoiser_swap.sh --next15h GPU_ID
+# CPU checks only: bash run_celeba_denoiser_swap.sh --check
+# Shell-only entry point; existing Python sources and their training hash stay intact.
+set -euo pipefail
+
+if [[ "${1:-}" != _container ]]; then
+  plan=swap
+  if [[ "${1:-}" == --next15h ]]; then plan=next15h; shift; fi
+  [[ $# == 1 ]] || { echo 'Usage: bash run_celeba_denoiser_swap.sh [--next15h] GPU_ID|--check' >&2; exit 2; }
+  main="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  launcher="$(basename "${BASH_SOURCE[0]}")"
+  root=/workspace/score_sde_pytorch
+  image_id="$(docker image inspect --format '{{.Id}}' "${DENOISER_SWAP_IMAGE:-score-sde-h200}")"
+  if [[ "$1" == --check ]]; then
+    docker run --rm --network none --cpus 2 --memory 4g \
+      --mount "type=bind,src=$main,dst=$root,readonly" --workdir "$root" \
+      --env SWAP_SELF_TEST=1 --env SWAP_PLAN="$plan" --env PYTHONDONTWRITEBYTECODE=1 \
+      --env CUDA_VISIBLE_DEVICES= --env NVIDIA_VISIBLE_DEVICES=void \
+      --entrypoint bash "$image_id" "$launcher" _container
+    exit
+  fi
+  gpu="$1"
+  [[ "$gpu" =~ ^[0-9]+$ || "$gpu" == GPU-* ]] || { echo 'Expected a physical GPU index or UUID.' >&2; exit 2; }
+  output="$(realpath -m "${DENOISER_SWAP_OUTPUT:-$(dirname "$main")/celeba_denoiser_swap_10k}")"
+  name=celeba-denoiser-swap-10k-seeds01
+  if [[ "$plan" == next15h ]]; then
+    output="$(realpath -m "${NFE_AB_OUTPUT:-$(dirname "$main")/celeba_nfe_ab_15h_20261027}")"
+    name="${NFE_AB_CONTAINER:-celeba-nfe-ab-15h-seed0}"
+    native_baseline="${NFE_AB_NATIVE_BASELINE:-$(dirname "$main")/celeba_denoiser_swap_10k/results}"
+    ab_root="${NFE_AB_SEED43_ROOT:-$(dirname "$main")/ab_replication_seed43}"
+  fi
+  [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo "Invalid container name: $name" >&2; exit 2; }
+  case "$output/" in "$main/"*|/) echo 'Output must be outside the source repository.' >&2; exit 2 ;; esac
+  [[ ! -e "$output" ]] || { echo "Output exists: $output; inspect/resume the original container." >&2; exit 1; }
+  if docker inspect "$name" >/dev/null 2>&1; then
+    echo "Container exists: $name; inspect/resume it." >&2; exit 1
+  fi
+  tfds="${TFDS_DATA_DIR:-$root/.tfds}"
+  extensions="${TORCH_EXTENSIONS_DIR:-$root/.torch_extensions}"
+  cache="${XDG_CACHE_HOME:-$root/.cache}"
+  for path in "$tfds" "$extensions" "$cache"; do
+    [[ "$path" == /* && "$path" != *','* && "$path" != *'..'* ]] || { echo "Invalid cache path: $path" >&2; exit 2; }
+    case "$path/" in
+      "$root/.tfds/"|"$root/.torch_extensions/"|"$root/.cache/") ;;
+      "$root/"*|/|/workspace/|/output/|/output/*|/opt/|/opt/*|/tmp/|/usr/*|/etc/*|/proc/*|/dev/*|/sys/*|/bin/*|/sbin/*|/lib/*|/lib64/*)
+        echo "Cache overlaps runtime/system directories: $path" >&2; exit 2 ;;
+    esac
+  done
+  for pair in "$tfds|$extensions" "$tfds|$cache" "$extensions|$cache"; do
+    left="${pair%%|*}/"; right="${pair#*|}/"
+    [[ "$left" != "$right"* && "$right" != "$left"* ]] || { echo 'Cache mounts must not overlap.' >&2; exit 2; }
+  done
+  cd "$main"
+  reference=assets/stats/celeba_64_0c2d89311192_stats.npz
+  inputs=("$reference"
+    workdirs/celeba_vp_continuous_50k/checkpoints/checkpoint_260.pth
+    workdirs/celeba_fox_matern32_kappa1000_50k/checkpoints/checkpoint_260.pth)
+  for path in "${inputs[@]}" sampling.py splice_model.py "$launcher"; do
+    [[ -s "$path" ]] || { echo "Missing input: $path" >&2; exit 1; }
+  done
+  if [[ "$plan" == next15h ]]; then
+    for route in vp tail; do
+      for file in manifest.json report_260.npz; do
+        [[ -s "$native_baseline/${route}_seed0/$file" ]] || { echo "Missing native baseline: $native_baseline/${route}_seed0/$file" >&2; exit 1; }
+      done
+    done
+    for arm in A B; do
+      if [[ "$arm" == A ]]; then label=A_vp_pvp; else label=B_vp_pfox; fi
+      workdir="celeba_ab_replication_${label}_seed43_200k"
+      for path in "$ab_root/workdirs/$workdir/checkpoints/checkpoint_4.pth" \
+        "$ab_root/workdirs/$workdir/run_manifest.json" \
+        "$ab_root/eval_workdirs/$workdir/eval_ab_replication_seed43_${arm}_common_ckpt4_nfe1000_10000samples_batch512_seed0/manifest.json" \
+        "$ab_root/eval_workdirs/$workdir/eval_ab_replication_seed43_${arm}_common_ckpt4_nfe1000_10000samples_batch512_seed0/report_4.npz"; do
+        [[ -s "$path" ]] || { echo "Missing seed43 input: $path" >&2; exit 1; }
+      done
+    done
+  fi
+  printf '%s  %s\n' 66f3e831815ccebf90fe477348fcd0de92e5d966b7ed1eef77dc80fab72b6327 "$reference" | sha256sum -c -
+  mkdir -p "$output/runtime" "$output/results" "$main/.tfds" "$main/.torch_extensions" "$main/.cache"
+  git ls-files -z -- '*.py' '*.sh' '*.c' '*.cc' '*.cpp' '*.cu' '*.cuh' '*.h' Dockerfile requirements.txt \
+    | tar --null -T - -cf - | tar -xf - -C "$output/runtime"
+  # fetch + restore --worktree can deliver this launcher outside HEAD/index.
+  # Freeze its actual on-disk contents explicitly, including in that case.
+  cp -- "$launcher" "$output/runtime/$launcher"
+  mkdir -p "$output/runtime/assets/stats" "$output/runtime/workdirs"
+  cp "$reference" "$output/runtime/$reference"
+  for arm in celeba_vp_continuous_50k celeba_fox_matern32_kappa1000_50k; do
+    mkdir -p "$output/runtime/workdirs/$arm/checkpoints"
+  done
+  if [[ "$plan" == next15h ]]; then
+    for route in vp tail; do
+      mkdir -p "$output/runtime/experiment_baselines/native_$route"
+      cp -- "$native_baseline/${route}_seed0/manifest.json" "$native_baseline/${route}_seed0/report_260.npz" \
+        "$output/runtime/experiment_baselines/native_$route/"
+    done
+    for arm in A B; do
+      if [[ "$arm" == A ]]; then label=A_vp_pvp; else label=B_vp_pfox; fi
+      workdir="celeba_ab_replication_${label}_seed43_200k"
+      mkdir -p "$output/runtime/workdirs/$workdir/checkpoints" "$output/runtime/experiment_baselines/ab_$arm"
+      cp -- "$ab_root/workdirs/$workdir/run_manifest.json" "$output/runtime/experiment_baselines/ab_$arm/training_manifest.json"
+      cp -- "$ab_root/eval_workdirs/$workdir/eval_ab_replication_seed43_${arm}_common_ckpt4_nfe1000_10000samples_batch512_seed0/manifest.json" \
+        "$ab_root/eval_workdirs/$workdir/eval_ab_replication_seed43_${arm}_common_ckpt4_nfe1000_10000samples_batch512_seed0/report_4.npz" \
+        "$output/runtime/experiment_baselines/ab_$arm/"
+    done
+  fi
+  for path in "$tfds" "$extensions" "$cache"; do
+    case "$path" in "$root"/*) mkdir -p "$output/runtime/${path#"$root"/}" ;; esac
+  done
+  (cd "$output/runtime"; find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$output/runtime.sha256"
+  sha256sum "${inputs[@]}" > "$output/inputs.sha256"
+  if [[ "$plan" == next15h ]]; then
+    for label in A_vp_pvp B_vp_pfox; do
+      workdir="celeba_ab_replication_${label}_seed43_200k"
+      checkpoint_hash="$(sha256sum "$ab_root/workdirs/$workdir/checkpoints/checkpoint_4.pth")"
+      printf '%s  %s\n' "${checkpoint_hash%% *}" "workdirs/$workdir/checkpoints/checkpoint_4.pth" >> "$output/inputs.sha256"
+    done
+  fi
+  git rev-parse HEAD > "$output/commit.txt"
+  git status --porcelain > "$output/source_status.txt"
+  printf 'image=%s\nphysical_gpu=%s\nTFDS_DATA_DIR=%s\nTORCH_EXTENSIONS_DIR=%s\nXDG_CACHE_HOME=%s\nplan=%s\n' \
+    "$image_id" "$gpu" "$tfds" "$extensions" "$cache" "$plan" > "$output/docker.txt"
+  args=(run -d --name "$name" --gpus "device=$gpu" --ipc=host
+    --mount "type=bind,src=$output/runtime,dst=$root,readonly"
+    --mount "type=bind,src=$output/results,dst=/output"
+    --mount "type=bind,src=$output,dst=/opt/denoiser-swap,readonly"
+    --mount "type=bind,src=$main/.tfds,dst=$tfds"
+    --mount "type=bind,src=$main/.torch_extensions,dst=$extensions"
+    --mount "type=bind,src=$main/.cache,dst=$cache"
+    --workdir "$root" --env CUDA_VISIBLE_DEVICES=0 --env PYTHONDONTWRITEBYTECODE=1 --env SWAP_PLAN="$plan"
+    --env TFDS_DATA_DIR="$tfds" --env TORCH_EXTENSIONS_DIR="$extensions" --env XDG_CACHE_HOME="$cache"
+    --env TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}" --env MAX_JOBS="${MAX_JOBS:-8}"
+    --entrypoint bash)
+  for arm in celeba_vp_continuous_50k celeba_fox_matern32_kappa1000_50k; do
+    args+=(--mount "type=bind,src=$main/workdirs/$arm/checkpoints,dst=$root/workdirs/$arm/checkpoints,readonly")
+  done
+  if [[ "$plan" == next15h ]]; then
+    for label in A_vp_pvp B_vp_pfox; do
+      workdir="celeba_ab_replication_${label}_seed43_200k"
+      args+=(--mount "type=bind,src=$ab_root/workdirs/$workdir/checkpoints,dst=$root/workdirs/$workdir/checkpoints,readonly")
+    done
+  fi
+  docker "${args[@]}" "$image_id" "$launcher" _container
+  docker inspect "$name" > "$output/docker_inspect_start.json"
+  printf 'Started %s on GPU %s. Results: %s/results\n' "$name" "$gpu" "$output"
+  exit
+fi
+
+if [[ "${SWAP_SELF_TEST:-0}" != 1 ]]; then
+  [[ "${CUDA_VISIBLE_DEVICES:-}" == 0 ]] || { echo 'Expected one Docker-routed GPU, CVD=0.' >&2; exit 2; }
+  exec > >(tee -a /output/queue.log) 2>&1
+  trap 'code=$?; printf "failed exit=%s\n" "$code" > /output/queue.state' ERR
+  sha256sum -c /opt/denoiser-swap/runtime.sha256
+  sha256sum -c /opt/denoiser-swap/inputs.sha256
+  printf 'running\n' > /output/queue.state
+fi
+
+python -u - <<'PY_DENOISER_SWAP'
+"""VP/tail trajectories crossed with VP/FOX endpoint denoisers; Docker only."""
+import gc
+import hashlib
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+import torch
+if torch.cuda.is_available():
+    torch.cuda.init()  # Match main.py: initialize Torch before TensorFlow.
+import numpy as np
+import tensorflow as tf
+import tensorflow_gan as tfgan
+
+# CPU checks need the real SDE/sampler/adapter, but no NCSN++ CUDA extensions.
+if os.environ.get('SWAP_SELF_TEST') != '1':
+    import run_lib  # Registers the native model definitions for scientific eval.
+import sampling
+import sde_lib
+import evaluation
+import datasets
+import losses
+from models import utils as mutils
+from models.ema import ExponentialMovingAverage
+from splice_model import SplicedEpsModel
+from configs.vp.celeba_ncsnpp_continuous import get_config as get_vp
+from configs.fox.celeba_ncsnpp_continuous_matern_3_2 import get_config as get_fox
+from artifact_utils import (atomic_savez, atomic_write_bytes, build_model_manifest,
+                            build_eval_manifest, ensure_eval_manifest,
+                            validate_npz_metadata)
+from reproducibility import configure_reproducibility, derive_seed, isolated_torch_rng
+from utils import restore_checkpoint
+from ml_collections import ConfigDict
+from configs.factorial.celeba_a_vp_pvp import get_config as get_a
+from configs.factorial.celeba_b_vp_pfox import get_config as get_b
+
+ROOT = Path('/workspace/score_sde_pytorch')
+OUTPUT = Path('/output')
+REFERENCE = 'assets/stats/celeba_64_0c2d89311192_stats.npz'
+REFERENCE_SHA = '66f3e831815ccebf90fe477348fcd0de92e5d966b7ed1eef77dc80fab72b6327'
+ARMS = {'vp': 'celeba_vp_continuous_50k', 'fox': 'celeba_fox_matern32_kappa1000_50k'}
+VARIANTS = ('tweedie_vp', 'tweedie_fox')
+COUNT, BATCH, STEPS = 10000, 512, 1000
+ENDPOINT, THRESHOLD = 10.575749165617202, -3.3
+COMMON_ENDPOINT = 9.115429865459795
+BASELINES = ROOT / 'experiment_baselines'
+AB_ARMS = {'A': 'celeba_ab_replication_A_vp_pvp_seed43_200k',
+           'B': 'celeba_ab_replication_B_vp_pfox_seed43_200k'}
+
+
+def digest(path):
+    result = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            result.update(block)
+    return result.hexdigest()
+
+
+def array_digest(array):
+    array = np.ascontiguousarray(array)
+    result = hashlib.sha256()
+    result.update(str(array.dtype).encode('ascii'))
+    result.update(str(array.shape).encode('ascii'))
+    result.update(array.tobytes())
+    return result.hexdigest()
+
+
+def scalar(array):
+    return np.asarray(array).item()
+
+
+def read_archive(path, identity, required, linked=None):
+    with np.load(str(path), allow_pickle=False) as archive:
+        validate_npz_metadata(
+            archive, str(path), str(identity['protocol_sha256']),
+            str(identity['checkpoint_id']), required_arrays=required,
+            checkpoint_step=int(identity['checkpoint_step']))
+        for key, value in dict(identity, **(linked or {})).items():
+            if key not in archive.files or not np.array_equal(archive[key], np.asarray(value)):
+                raise ValueError(f'Cached artifact has wrong {key}: {path}')
+        return {key: archive[key].copy() for key in archive.files}
+
+
+def publish_json(path, value):
+    atomic_write_bytes(str(path), (json.dumps(value, indent=2, sort_keys=True,
+                                            allow_nan=False) + '\n').encode(), overwrite=True)
+
+
+def make_config(seed, route, group='native', steps=STEPS):
+    if group == 'native':
+        vp, fox = get_vp(), get_fox()
+        fox.model.fox_u = -5.0
+        fox.model.fox_drift_schedule = 'constant'
+        fox.model.fox_normalize_scale = False
+        fox.model.fox_matern_length_scale = 346.4101615138
+        fox.model.fox_target_terminal_variance = 1.0
+        checkpoint, endpoint = 260, ENDPOINT
+    elif group == 'controlled':
+        configs = []
+        for arm, factory, allocation in (('A', get_a, 'vp_time'), ('B', get_b, 'normalized_fox_time')):
+            manifest = json.loads((BASELINES / f'ab_{arm}/training_manifest.json').read_text())
+            config = ConfigDict(manifest['config'])
+            label = 'A_vp_pvp' if arm == 'A' else 'B_vp_pfox'
+            if (config.seed != 43 or config.training.sde != 'vpsde' or
+                    config.training.factorial_arm != label or
+                    config.training.noise_distribution != allocation or
+                    config.training.snapshot_freq != 50000 or
+                    config.training.batch_size != 128 or
+                    config.model.noise_conditioning != 'logsnr' or
+                    config.model.logsnr_min != -10.0 or config.model.logsnr_max != COMMON_ENDPOINT):
+                raise RuntimeError(f'Unexpected controlled training configuration: {arm}')
+            config.eval = factory().eval
+            config.training.n_iters = 200000
+            configs.append(config)
+        vp, fox = configs
+        checkpoint, endpoint = 4, COMMON_ENDPOINT
+    else:
+        raise ValueError(group)
+    vp.allow_tf32, vp.cudnn_benchmark = True, True
+    vp.deterministic = False
+    vp.allow_fp16_reduced_precision_reduction = False
+    vp.sampling.time_grid = 'uniform_logsnr'
+    vp.sampling.logsnr_min, vp.sampling.logsnr_max = -10.0, endpoint
+    vp.sampling.noise_removal = False  # Return raw x at the actual endpoint.
+    vp.sampling.probability_flow = False
+    vp.eval.begin_ckpt = vp.eval.end_ckpt = checkpoint
+    vp.eval.num_samples, vp.eval.batch_size = COUNT, BATCH
+    vp.eval.sampling_num_scales, vp.eval.sampling_seed = steps, seed
+    vp.eval.enable_loss = vp.eval.enable_bpd = False
+    vp.eval.enable_sampling = True
+    vp.eval.endpoint_denoise_variants = False
+    vp.eval.denoiser_swap_route = route
+    vp.eval.denoiser_swap_group = group
+    vp.eval.denoiser_swap_threshold = THRESHOLD
+    vp.eval.denoiser_swap_variants = VARIANTS if group == 'native' else ('tweedie_a', 'tweedie_b')
+    vp.eval.denoiser_swap_alt_config = fox
+    return vp, fox
+
+
+def make_route(vp, fox, vp_sde, fox_sde, route, eps, device, shared=False):
+    if route not in ('vp', 'head', 'tail'):
+        raise ValueError(route)
+    return SplicedEpsModel(vp, fox, vp_sde, fox_sde,
+                           mode='none' if route == 'vp' else route,
+                           threshold=None if route == 'vp' else THRESHOLD,
+                           sampling_eps=eps, time_grid='uniform_logsnr',
+                           device=device, shared_logsnr_conditioning=shared).eval()
+
+
+def trajectory(sampler, model, seed):
+    model.reset_route()
+    with isolated_torch_rng(seed), torch.no_grad():
+        state, nfe = sampler(model)
+    # The existing splice class expects N predictor calls PLUS one final call.
+    # Here final calls bypass the router and use both child models independently.
+    expected = model.expected_routes[:-1]
+    if nfe != len(expected) or tuple(model.route_history) != expected:
+        raise RuntimeError('Trajectory used the wrong network route or NFE.')
+    if state.dtype != torch.float32 or not torch.isfinite(state).all():
+        raise RuntimeError('Invalid raw endpoint state.')
+    return state.detach().cpu().numpy(), np.asarray(expected, dtype=np.bool_)
+
+
+def denoise_pair(x, end_t, sde, vp_score, fox_score, inverse_scaler, variants=VARIANTS):
+    """Apply both scores to the identical, unmodified raw state at the last node."""
+    with torch.no_grad():
+        original = x.clone()
+        alpha, sigma = sde.marginal_prob(torch.ones_like(x[:, :1, :1, :1]), end_t)
+        outputs = {}
+        for name, score_fn in zip(variants, (vp_score, fox_score)):
+            score = score_fn(x, end_t)
+            if not torch.equal(x, original):
+                raise RuntimeError('A denoiser modified its shared input state.')
+            clean = (x + sigma[:, None, None, None].square() * score) / alpha
+            image = inverse_scaler(clean)
+            if not torch.isfinite(image).all():
+                raise RuntimeError('Non-finite denoised output.')
+            outputs[name] = image
+        return outputs
+
+
+def load_model(config, arm, path=None, expected_step=1300002):
+    path = Path(path) if path is not None else ROOT / 'workdirs' / ARMS[arm] / 'checkpoints/checkpoint_260.pth'
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    model = mutils.create_model(config)
+    optimizer = losses.get_optimizer(config, model.parameters())
+    ema = ExponentialMovingAverage(model.parameters(), decay=config.model.ema_rate)
+    state = dict(model=model, optimizer=optimizer, ema=ema, step=0,
+                 model_protocol_sha256=build_model_manifest(config)['model_protocol_sha256'])
+    restore_checkpoint(str(path), state, device=config.device, restore_rng=False)
+    if int(state['step']) != expected_step:
+        raise RuntimeError(f'Wrong final checkpoint step: {arm}')
+    ema.copy_to(model.parameters())
+    identity = {'checkpoint_id': state['checkpoint_id'], 'checkpoint_step': int(state['step']),
+                'checkpoint_sha256': digest(path),
+                'training_protocol_sha256': state.get('training_protocol_sha256') or 'legacy-unknown'}
+    model.eval()
+    del optimizer, ema, state
+    gc.collect()
+    torch.cuda.empty_cache()
+    return model, identity
+
+
+def check_snapshot():
+    for filename in ('runtime.sha256', 'inputs.sha256'):
+        subprocess.run(['sha256sum', '--status', '-c', '/opt/denoiser-swap/' + filename],
+                       cwd=str(ROOT), check=True)
+
+
+def evaluate_cell(seed, route, vp_model, fox_model, identities, inception, reference,
+                  group='native', steps=STEPS, folder_name=None):
+    check_snapshot()
+    config, fox_config = make_config(seed, route, group, steps)
+    checkpoint = 260 if group == 'native' else 4
+    endpoint = ENDPOINT if group == 'native' else COMMON_ENDPOINT
+    primary, alternate = ('vp', 'fox') if group == 'native' else ('A', 'B')
+    variants = VARIANTS if group == 'native' else ('tweedie_a', 'tweedie_b')
+    sde, eps = run_lib.get_sde(config, n_override=steps)
+    fox_sde, _ = run_lib.get_sde(fox_config)
+    model = make_route(vp_model, fox_model, sde, fox_sde, route, eps, config.device,
+                       shared=group == 'controlled')
+    grid = sde.sampling_time_grid(eps, grid='uniform_logsnr', device=config.device,
+                                 dtype=torch.float32, N=steps + 1)
+    grid_hash = array_digest(grid.cpu().numpy())
+    expected_history = np.asarray(model.expected_routes[:-1], dtype=np.bool_)
+    end_t = torch.full((BATCH,), grid[-1].item(), device=config.device, dtype=torch.float32)
+    alpha, sigma = sde.marginal_prob(torch.ones((BATCH, 1, 1, 1), device=config.device), end_t)
+    if not torch.allclose(sde.log_snr(end_t), torch.full_like(end_t, endpoint), atol=1e-3, rtol=0):
+        raise RuntimeError('Actual endpoint does not match the requested log-SNR.')
+    folder = OUTPUT / (folder_name or f'{route}_seed{seed}')
+    manifest = build_eval_manifest(config)
+    manifest.pop('protocol_sha256')
+    manifest['experiment'] = dict(
+        name='celeba-denoiser-swap-v2', group=group, variants=variants,
+        launcher_sha256=digest(ROOT / 'run_celeba_denoiser_swap.sh'),
+        checkpoints=identities, reference_sha256=REFERENCE_SHA, grid_sha256=grid_hash,
+        trajectory_nfe=steps, denoiser_calls=2, executed_nfe=steps + 2,
+        nfe_per_output=steps + 1, paired_denoisers=True,
+        between_route_pairing='not_assumed', raw_state_coordinates='centered_NCHW_float32',
+        quantization='inverse_scaler; clip(image*255,0,255); uint8',
+        route_vp_calls=int((~expected_history).sum()), route_fox_calls=int(expected_history.sum()))
+    manifest['protocol_sha256'] = hashlib.sha256(json.dumps(
+        manifest, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()).hexdigest()
+    protocol = ensure_eval_manifest(str(folder), manifest)
+    base = dict(protocol_sha256=protocol, **identities[primary],
+                alt_checkpoint_id=identities[alternate]['checkpoint_id'],
+                alt_checkpoint_step=identities[alternate]['checkpoint_step'],
+                alt_training_protocol_sha256=identities[alternate]['training_protocol_sha256'],
+                grid_sha256=grid_hash, group=group, route=route, trajectory_nfe=steps,
+                denoiser_calls=2, executed_nfe=steps + 2, nfe_per_output=steps + 1)
+    sample_dir = folder / f'ckpt_{checkpoint}'
+    sample_dir.mkdir(exist_ok=True)
+    sampler = sampling.get_pc_sampler(
+        sde, (BATCH, 3, 64, 64), sampling.EulerMaruyamaPredictor,
+        sampling.NoneCorrector, inverse_scaler=lambda x: x,
+        snr=config.sampling.snr, continuous=True, denoise=False,
+        time_grid='uniform_logsnr', eps=eps, device=config.device)
+    scores = (mutils.get_score_fn(sde, vp_model, train=False, continuous=True),
+              mutils.get_score_fn(sde, model.fox_adapter, train=False, continuous=True))
+    inverse_scaler = datasets.get_data_inverse_scaler(config)
+    pools, logits = {v: [] for v in variants}, {v: [] for v in variants}
+    statistics_hashes = []
+    for round_id in range(math.ceil(COUNT / BATCH)):
+        derived = derive_seed(seed, 'sampling-round', round_id)
+        identity = dict(base, round_id=round_id, sampling_seed=derived,
+                        sample_start=round_id * BATCH, num_samples=BATCH)
+        state_path = sample_dir / f'state_{round_id}.npz'
+        samples_path = sample_dir / f'samples_{round_id}.npz'
+        stat_path = sample_dir / f'statistics_{round_id}.npz'
+        state_keys = ('x_endpoint', 'route_history', 'endpoint_t', 'alpha', 'sigma', 'state_sha256')
+        if state_path.exists():
+            state = read_archive(state_path, identity, state_keys)
+        else:
+            if samples_path.exists() or stat_path.exists():
+                raise RuntimeError(f'Cannot reconstruct a missing float state from cached uint8/features: {state_path}')
+            x, history = trajectory(sampler, model, derived)
+            state = dict(identity, x_endpoint=x, route_history=history,
+                         endpoint_t=np.asarray(grid[-1].item()), alpha=alpha.cpu().numpy(),
+                         sigma=sigma.cpu().numpy(), state_sha256=array_digest(x))
+            atomic_savez(str(state_path), **state)
+        x = state['x_endpoint']
+        if (x.shape != (BATCH, 3, 64, 64) or x.dtype != np.float32 or
+                not np.array_equal(state['route_history'], expected_history) or
+                scalar(state['state_sha256']) != array_digest(x) or
+                scalar(state['endpoint_t']) != grid[-1].item() or
+                not np.array_equal(state['alpha'], alpha.cpu().numpy()) or
+                not np.array_equal(state['sigma'], sigma.cpu().numpy())):
+            raise RuntimeError(f'Invalid saved raw state or route: {state_path}')
+        linked = dict(state_sha256=scalar(state['state_sha256']))
+        image_keys = tuple(f'samples_{v}' for v in variants)
+        if samples_path.exists():
+            images = read_archive(samples_path, identity, image_keys, linked)
+        else:
+            outputs = denoise_pair(torch.from_numpy(x).to(config.device), end_t, sde,
+                                   *scores, inverse_scaler=inverse_scaler, variants=variants)
+            images = dict(identity, **linked)
+            for variant in variants:
+                images[f'samples_{variant}'] = np.clip(
+                    outputs[variant].permute(0, 2, 3, 1).cpu().numpy() * 255., 0, 255).astype(np.uint8)
+            atomic_savez(str(samples_path), **images)
+            del outputs
+        for key in image_keys:
+            if images[key].shape != (BATCH, 64, 64, 3) or images[key].dtype != np.uint8:
+                raise RuntimeError(f'Invalid denoised images: {samples_path}')
+        linked['samples_sha256'] = digest(samples_path)
+        stat_keys = tuple(k for v in variants for k in (f'pool_3_{v}', f'logits_{v}'))
+        if stat_path.exists():
+            stats = read_archive(stat_path, identity, stat_keys, linked)
+        else:
+            stats = dict(identity, **linked)
+            for variant in variants:
+                gc.collect()
+                result = evaluation.run_inception_distributed(images[f'samples_{variant}'], inception)
+                stats[f'pool_3_{variant}'] = result['pool_3'].numpy()
+                stats[f'logits_{variant}'] = result['logits'].numpy()
+            atomic_savez(str(stat_path), **stats)
+        statistics_hashes.append(digest(stat_path))
+        for variant in variants:
+            pool, logit = stats[f'pool_3_{variant}'], stats[f'logits_{variant}']
+            if pool.shape != (BATCH, 2048) or logit.ndim != 2 or logit.shape[0] != BATCH:
+                raise RuntimeError(f'Wrong Inception batch shape: {stat_path}')
+            if not np.isfinite(pool).all() or not np.isfinite(logit).all():
+                raise RuntimeError(f'Non-finite Inception batch: {stat_path}')
+            pools[variant].append(pool)
+            logits[variant].append(logit)
+        logging.info('Completed group=%s route=%s steps=%s seed=%s batch=%s/20; both denoisers share state=%s',
+                     group, route, steps, seed, round_id + 1, linked['state_sha256'])
+        del state, images, stats
+    report_identity = dict(base, num_samples=COUNT, sampling_seed=seed, dataset_stats_id=REFERENCE_SHA,
+                           statistics_sha256=hashlib.sha256(''.join(statistics_hashes).encode()).hexdigest())
+    metric_keys = tuple(f'{metric}_{v}' for v in variants for metric in ('IS', 'fid', 'kid'))
+    report_path = folder / f'report_{checkpoint}.npz'
+    if report_path.exists():
+        report = read_archive(report_path, report_identity, metric_keys)
+    else:
+        report = dict(report_identity)
+        for variant in variants:
+            pool = np.concatenate(pools[variant], axis=0)[:COUNT]
+            logit = np.concatenate(logits[variant], axis=0)[:COUNT]
+            report[f'IS_{variant}'] = np.asarray(tfgan.eval.classifier_score_from_logits(logit))
+            report[f'fid_{variant}'] = np.asarray(tfgan.eval.frechet_classifier_distance_from_activations(reference, pool))
+            tf.random.set_seed(derive_seed(seed, 'denoiser-swap-kid', route, variant))
+            report[f'kid_{variant}'] = np.asarray(tfgan.eval.kernel_classifier_distance_from_activations(
+                tf.convert_to_tensor(reference), tf.convert_to_tensor(pool)).numpy())
+        if not all(np.isfinite(report[k]) for k in metric_keys):
+            raise RuntimeError('Non-finite report metrics.')
+        atomic_savez(str(report_path), **report)
+    metrics = {k: float(report[k]) for k in metric_keys}
+    publish_json(folder / 'result.json', dict(group=group, route=route, steps=steps, seed=seed, **metrics))
+    for variant in variants:
+        logging.info('SWAP route=%s seed=%s %s IS=%.6f FID=%.6f KID=%.9f group=%s steps=%s', route, seed, variant,
+                     metrics[f'IS_{variant}'], metrics[f'fid_{variant}'], metrics[f'kid_{variant}'], group, steps)
+    return metrics
+
+
+def self_test():
+    """CPU-only scientific checks: endpoint, pairing, route and stale-cache rejection."""
+    config, fox_config = make_config(0, 'tail')
+    config.device = fox_config.device = torch.device('cpu')
+    sde = sde_lib.VPSDE(beta_min=config.model.beta_min, beta_max=config.model.beta_max, N=4)
+    sde.noise_conditioning = 'time'
+    sde.sampling_logsnr_min, sde.sampling_logsnr_max = -10.0, ENDPOINT
+    fox_sde = sde_lib.FoxVPSDE(u=fox_config.model.fox_u, kernel='matern_3_2',
+                              matern_length_scale=fox_config.model.fox_matern_length_scale,
+                              target_terminal_variance=1.0, N=STEPS)
+    eps = 1e-3
+    class Constant(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.value = value
+        def forward(self, x, labels):
+            return torch.full_like(x, self.value)
+    class Spy(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.value, self.inputs = value, []
+        def forward(self, x, labels):
+            self.inputs.append((x.clone(), labels.clone()))
+            return torch.full_like(x, self.value)
+    for route in ('vp', 'tail'):
+        model = make_route(Constant(0.1), Constant(-0.2), sde, fox_sde, route, eps, 'cpu')
+        sampler = sampling.get_pc_sampler(sde, (2, 3, 4, 4), sampling.EulerMaruyamaPredictor,
+                    sampling.NoneCorrector, lambda x: x, snr=0.17, continuous=True,
+                    denoise=False, time_grid='uniform_logsnr', eps=eps, device='cpu')
+        x, history = trajectory(sampler, model, 17)
+        assert len(history) == 4 and (not history.any() if route == 'vp' else history.any())
+        assert len(model.route_history) == 4  # No hidden final network call.
+        original_sampler = sampling.get_pc_sampler(
+            sde, (2, 3, 4, 4), sampling.EulerMaruyamaPredictor, sampling.NoneCorrector,
+            lambda y: y, snr=0.17, continuous=True, denoise=True,
+            endpoint_variants=True, time_grid='uniform_logsnr', eps=eps, device='cpu')
+        model.reset_route()
+        with isolated_torch_rng(17):
+            original_outputs, original_nfe = original_sampler(model)
+        model.checked_route_metadata()
+        assert original_nfe == 5
+        assert np.array_equal(x, original_outputs['x_t'].numpy())
+        row_scores = [mutils.get_score_fn(sde, m, train=False, continuous=True)
+                      for m in (model.vp_model, model.fox_adapter)]
+        row_grid = sde.sampling_time_grid(eps, grid='uniform_logsnr', device='cpu',
+                                          dtype=torch.float32, N=5)
+        row_outputs = denoise_pair(torch.from_numpy(x), row_grid[-1].repeat(2), sde,
+                                   *row_scores, inverse_scaler=lambda y: y)
+        variant = 'tweedie_vp' if route == 'vp' else 'tweedie_fox'
+        torch.testing.assert_close(row_outputs[variant], original_outputs['tweedie_xt'])
+    a, b = Spy(0.25), Spy(-0.5)
+    scores = [mutils.get_score_fn(sde, m.eval(), train=False, continuous=True) for m in (a, b)]
+    x = torch.from_numpy(x)
+    grid = sde.sampling_time_grid(eps, grid='uniform_logsnr', device='cpu', dtype=torch.float32, N=5)
+    t = grid[-1].repeat(2)
+    original = x.clone()
+    outputs = denoise_pair(x, t, sde, *scores, inverse_scaler=lambda y: y)
+    alpha, sigma = sde.marginal_prob(torch.ones_like(x[:, :1, :1, :1]), t)
+    for variant, eps_value in zip(VARIANTS, (0.25, -0.5)):
+        torch.testing.assert_close(outputs[variant], (original - sigma[:, None, None, None] * eps_value) / alpha)
+    assert torch.equal(x, original)
+    assert torch.equal(a.inputs[0][0], b.inputs[0][0])
+    torch.testing.assert_close(a.inputs[0][1], t * 999)
+    identity = dict(protocol_sha256='test', checkpoint_id='vp', checkpoint_step=1300002,
+                    alt_checkpoint_id='fox', round_id=0, sampling_seed=17)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / 'state.npz'
+        atomic_savez(str(path), **identity, x_endpoint=x.numpy())
+        restored = read_archive(path, identity, ('x_endpoint',))
+        assert np.array_equal(restored['x_endpoint'], x.numpy())
+        for changed in (dict(identity, sampling_seed=18), dict(identity, alt_checkpoint_id='other')):
+            try:
+                read_archive(path, changed, ('x_endpoint',))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('A stale seed/alternate-checkpoint cache was accepted.')
+    # Controlled models use log-SNR labels, not native FOX time/scale conversion.
+    shared_sde = sde_lib.VPSDE(N=4)
+    shared_sde.noise_conditioning = 'logsnr'
+    shared_sde.conditioning_logsnr_min = shared_sde.sampling_logsnr_min = -10.0
+    shared_sde.conditioning_logsnr_max = shared_sde.sampling_logsnr_max = COMMON_ENDPOINT
+    for route in ('head', 'tail'):
+        model = make_route(Constant(0.1), Constant(-0.2), shared_sde, shared_sde,
+                           route, eps, 'cpu', shared=True)
+        sampler = sampling.get_pc_sampler(shared_sde, (2, 3, 4, 4), sampling.EulerMaruyamaPredictor,
+                    sampling.NoneCorrector, lambda y: y, snr=0.17, continuous=True,
+                    denoise=False, time_grid='uniform_logsnr', eps=eps, device='cpu')
+        raw, history = trajectory(sampler, model, 17)
+        assert history.any() and (~history).any()
+        assert isinstance(model.fox_adapter, Constant)
+        assert not hasattr(model.fox_adapter, 'target')
+        assert model.expected_routes[-1] == (route == 'tail')
+    # Verify ingestion of modern seed43 manifests and reject a wrong training seed.
+    global BASELINES
+    saved_baselines = BASELINES
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            BASELINES = Path(directory)
+            for arm, factory in (('A', get_a), ('B', get_b)):
+                cfg = factory()
+                cfg.seed = 43
+                folder = BASELINES / f'ab_{arm}'
+                folder.mkdir()
+                (folder / 'training_manifest.json').write_text(json.dumps(dict(config=cfg.to_dict()), default=str))
+            cfg_a, cfg_b = make_config(0, 'head', 'controlled', 1000)
+            assert cfg_a.seed == cfg_b.seed == 43
+            assert cfg_a.eval.begin_ckpt == 4 and cfg_a.eval.sampling_num_scales == 1000
+            assert cfg_a.model.noise_conditioning == cfg_b.model.noise_conditioning == 'logsnr'
+            path = BASELINES / 'ab_A/training_manifest.json'
+            wrong = json.loads(path.read_text())
+            wrong['config']['seed'] = 42
+            path.write_text(json.dumps(wrong))
+            try:
+                make_config(0, 'head', 'controlled', 1000)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('Wrong controlled training seed accepted.')
+    finally:
+        BASELINES = saved_baselines
+    baseline_self_test()
+    print('PASS: raw NFE/routes; E4/E3b control equivalence; endpoint/pairing/Tweedie; float/cache; controlled routes; legacy report/manifest seed checks.')
+
+
+def check_environment(manifest, label):
+    from artifact_utils import _environment_manifest
+    current = _environment_manifest()
+    for key in ('python', 'numpy', 'tensorflow', 'torch', 'torch_cuda', 'cudnn', 'packages'):
+        if current[key] != manifest['environment'][key]:
+            raise RuntimeError(f'Baseline/runtime environment differs for {label}: {key}')
+
+
+def audit_baseline(folder, config, identity, checkpoint, native=False, alternate=None):
+    """Verify cached point controls before any long trajectory in the new queue."""
+    manifest_path = folder / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text())
+    payload = dict(manifest)
+    protocol = payload.pop('protocol_sha256')
+    calculated = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':'),
+                                           ensure_ascii=True).encode()).hexdigest()
+    if protocol != calculated:
+        raise RuntimeError(f'Baseline manifest hash mismatch: {folder}')
+    cfg = manifest['config']
+    if build_model_manifest(ConfigDict(cfg))['model_protocol_sha256'] != build_model_manifest(config)['model_protocol_sha256']:
+        raise RuntimeError(f'Baseline model configuration mismatch: {folder}')
+    expected_eval = dict(num_samples=COUNT, batch_size=BATCH, sampling_num_scales=1000,
+                         sampling_seed=0, enable_loss=False, enable_bpd=False, enable_sampling=True,
+                         endpoint_denoise_variants=not native)
+    expected_sampling = dict(method='pc', predictor='euler_maruyama', corrector='none',
+                             time_grid='uniform_logsnr', probability_flow=False,
+                             noise_removal=not native, logsnr_min=-10.0,
+                             logsnr_max=ENDPOINT if native else COMMON_ENDPOINT)
+    if (any(cfg['eval'].get(k) != v for k, v in expected_eval.items()) or
+            any(cfg['sampling'].get(k) != v for k, v in expected_sampling.items()) or
+            cfg['seed'] != config.seed or not cfg.get('allow_tf32', False) or
+            not cfg.get('cudnn_benchmark', False) or cfg.get('deterministic', False) or
+            cfg.get('allow_fp16_reduced_precision_reduction', False)):
+        raise RuntimeError(f'Baseline evaluation/precision protocol mismatch: {folder}')
+    check_environment(manifest, str(folder))
+    expected = dict(protocol_sha256=protocol, checkpoint_id=identity['checkpoint_id'],
+                    checkpoint_step=identity['checkpoint_step'],
+                    training_protocol_sha256=identity['training_protocol_sha256'],
+                    num_samples=COUNT, dataset_stats_id=REFERENCE_SHA)
+    variants = VARIANTS if native else ('x_mean', 'x_t', 'tweedie_xt')
+    if native:
+        expected.update(sampling_seed=0, alt_checkpoint_id=alternate['checkpoint_id'],
+                        alt_checkpoint_step=alternate['checkpoint_step'],
+                        alt_training_protocol_sha256=alternate['training_protocol_sha256'],
+                        trajectory_nfe=1000, nfe_per_output=1001)
+        for key, loaded in (('vp', identity), ('fox', alternate)):
+            saved = manifest['experiment']['checkpoints'][key]
+            if any(saved.get(k) != loaded[k] for k in ('checkpoint_id', 'checkpoint_step', 'checkpoint_sha256')):
+                raise RuntimeError(f'Baseline checkpoint file mismatch: {folder}/{key}')
+        if manifest['experiment'].get('quantization') != 'inverse_scaler; clip(image*255,0,255); uint8':
+            raise RuntimeError(f'Baseline quantization mismatch: {folder}')
+    else:
+        expected['nfe'] = 1001
+    path = folder / f'report_{checkpoint}.npz'
+    keys = tuple(f'{metric}_{v}' for v in variants for metric in ('IS', 'fid', 'kid'))
+    report = read_archive(path, expected, keys)
+    # Historical endpoint_denoise_eval reports have no sampling_seed array.
+    # Their protocol_sha256 binds them to the manifest whose seed was checked above.
+    # Native swap reports require the array; reject conflicting values in either format.
+    if 'sampling_seed' in report and not np.array_equal(report['sampling_seed'], np.asarray(0)):
+        raise ValueError(f'Cached artifact has wrong sampling_seed: {path}')
+    return dict(metrics={k: float(report[k]) for k in keys},
+                protocol_sha256=protocol, source_sha256=manifest['source_sha256'],
+                sampling_seed=0,
+                sampling_seed_source='manifest_and_report' if 'sampling_seed' in report else 'manifest_protocol_hash',
+                manifest_sha256=digest(manifest_path), report_sha256=digest(path))
+
+
+def baseline_self_test():
+    cfg = get_a()
+    cfg.seed, cfg.allow_tf32, cfg.cudnn_benchmark = 43, True, True
+    cfg.eval.num_samples, cfg.eval.batch_size = COUNT, BATCH
+    cfg.eval.sampling_num_scales, cfg.eval.sampling_seed = 1000, 0
+    cfg.eval.enable_loss = cfg.eval.enable_bpd = False
+    cfg.eval.endpoint_denoise_variants = cfg.eval.enable_sampling = True
+    identity = dict(checkpoint_id='test-A', checkpoint_step=200001,
+                    training_protocol_sha256='test-training-A')
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        manifest = build_eval_manifest(cfg)
+        (folder / 'manifest.json').write_text(json.dumps(manifest))
+        arrays = dict(identity, protocol_sha256=manifest['protocol_sha256'],
+                      num_samples=COUNT, dataset_stats_id=REFERENCE_SHA, nfe=1001)
+        arrays.update({f'{metric}_{v}': 1.0 for v in ('x_mean', 'x_t', 'tweedie_xt')
+                       for metric in ('IS', 'fid', 'kid')})
+        path = folder / 'report_4.npz'
+        atomic_savez(str(path), **arrays)
+        audited = audit_baseline(folder, cfg, identity, 4)
+        assert audited['sampling_seed_source'] == 'manifest_protocol_hash'
+        atomic_savez(str(path), overwrite=True, **dict(arrays, sampling_seed=0))
+        audited = audit_baseline(folder, cfg, identity, 4)
+        assert audited['sampling_seed_source'] == 'manifest_and_report'
+        for wrong_key, wrong_value in (('num_samples', 5000), ('dataset_stats_id', 'other-reference'),
+                                        ('nfe', 2001), ('checkpoint_step', 100001), ('sampling_seed', 1)):
+            atomic_savez(str(path), overwrite=True, **dict(arrays, **{wrong_key: wrong_value}))
+            try:
+                audit_baseline(folder, cfg, identity, 4)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'Incompatible baseline accepted: {wrong_key}')
+        # Even without a report seed, a self-consistent manifest/report pair with
+        # another sampling seed must be rejected before any generation.
+        wrong_cfg = ConfigDict(cfg.to_dict())
+        wrong_cfg.eval.sampling_seed = 1
+        wrong_manifest = build_eval_manifest(wrong_cfg)
+        (folder / 'manifest.json').write_text(json.dumps(wrong_manifest))
+        atomic_savez(str(path), overwrite=True,
+                     **dict(arrays, protocol_sha256=wrong_manifest['protocol_sha256']))
+        try:
+            audit_baseline(folder, cfg, identity, 4)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('Legacy baseline with wrong manifest sampling seed accepted.')
+
+
+NEXT_QUEUE = (('native', 'vp', 2000), ('native', 'tail', 2000),
+              ('controlled', 'head', 1000), ('controlled', 'tail', 1000))
+
+
+def run_next15h(reference):
+    configs = dict(native=make_config(0, 'vp', 'native', 2000),
+                   controlled=make_config(0, 'head', 'controlled', 1000))
+    loaded, identities = {}, {}
+    # Check BOTH groups and all cached controls before spending hours on NFE.
+    for group in ('native', 'controlled'):
+        loaded[group], identities[group] = {}, {}
+        names = ('vp', 'fox') if group == 'native' else ('A', 'B')
+        for key, cfg in zip(names, configs[group]):
+            if group == 'native':
+                model, model_id = load_model(cfg, key)
+            else:
+                training = json.loads((BASELINES / f'ab_{key}/training_manifest.json').read_text())
+                check_environment(training, f'training/{key}')
+                path = ROOT / 'workdirs' / AB_ARMS[key] / 'checkpoints/checkpoint_4.pth'
+                model, model_id = load_model(cfg, key, path=path, expected_step=200001)
+                if model_id['training_protocol_sha256'] != training['training_protocol_sha256']:
+                    raise RuntimeError(f'Controlled training/checkpoint identity mismatch: {key}')
+            loaded[group][key], identities[group][key] = model, model_id
+    native_controls = {}
+    for route in ('vp', 'tail'):
+        control = audit_baseline(BASELINES / f'native_{route}', configs['native'][0],
+                                 identities['native']['vp'], 260, native=True,
+                                 alternate=identities['native']['fox'])
+        manifest = json.loads((BASELINES / f'native_{route}/manifest.json').read_text())
+        if (manifest['config']['eval'].get('denoiser_swap_route') != route or
+                manifest['config']['eval'].get('denoiser_swap_threshold') != THRESHOLD):
+            raise RuntimeError(f'Wrong native baseline route/threshold: {route}')
+        native_controls[route] = control
+    ab_controls = {}
+    for key, cfg in zip(('A', 'B'), configs['controlled']):
+        ab_controls[key] = audit_baseline(BASELINES / f'ab_{key}', cfg,
+                                          identities['controlled'][key], 4)
+    # A few forward calls catch real-model/adapter incompatibilities before NFE.
+    for group in ('native', 'controlled'):
+        cfg, alt_cfg = configs[group]
+        steps = 2000 if group == 'native' else 1000
+        sde, eps = run_lib.get_sde(cfg, n_override=steps)
+        alt_sde, _ = run_lib.get_sde(alt_cfg)
+        first, second = ('vp', 'fox') if group == 'native' else ('A', 'B')
+        router = make_route(loaded[group][first], loaded[group][second], sde, alt_sde,
+                            'vp', eps, cfg.device, shared=group == 'controlled')
+        grid = sde.sampling_time_grid(eps, grid='uniform_logsnr', device=cfg.device,
+                                     dtype=torch.float32, N=steps + 1)
+        probe = torch.zeros((2, 3, 64, 64), device=cfg.device)
+        probe_t = torch.full((2,), grid[-1].item(), device=cfg.device)
+        with torch.no_grad():
+            for network in (loaded[group][first], router.fox_adapter):
+                score = mutils.get_score_fn(sde, network, train=False, continuous=True)(probe, probe_t)
+                if score.shape != probe.shape or not torch.isfinite(score).all():
+                    raise RuntimeError(f'Invalid real-model endpoint score: {group}')
+        del router, probe, score
+    preflight = dict(status='passed', plan='next15h', num_samples=COUNT, sampling_seed=0,
+                     queue=NEXT_QUEUE, checkpoints=identities,
+                     real_model_endpoint_probes='passed; two zero inputs per model; no generated metrics',
+                     native_baselines=native_controls, controlled_baselines=ab_controls,
+                     source_policy='Frozen new runtime; model/sampler/reference/precision/environment verified. '
+                                   'Historical source hashes recorded; cross-run sample pairing not assumed.')
+    publish_json(OUTPUT / 'preflight.json', preflight)
+    logging.info('NEXT15H preflight PASSED: four checkpoints and four cached baseline reports verified.')
+    inception = evaluation.get_inception_model(inceptionv3=False)
+    result = dict(status='running', plan='next15h', num_samples=COUNT, sampling_seed=0,
+                  cells={}, contrasts={}, baseline_reports=dict(native=native_controls, controlled=ab_controls),
+                  uncertainty='point estimates only; bootstrap not run')
+    for index, (group, route, steps) in enumerate(NEXT_QUEUE):
+        cfg = make_config(0, route, group, steps)[0]
+        configure_reproducibility(cfg, tensorflow_module=tf)
+        first, second = ('vp', 'fox') if group == 'native' else ('A', 'B')
+        folder = f'{group}_{route}_nfe{steps}_seed0'
+        logging.info('=== NEXT15H cell=%s/4 group=%s route=%s steps=%s samples=%s seed=0 ===',
+                     index + 1, group, route, steps, COUNT)
+        result['cells'][folder] = evaluate_cell(
+            0, route, loaded[group][first], loaded[group][second], identities[group],
+            inception, reference, group=group, steps=steps, folder_name=folder)
+        cells = result['cells']
+        if index >= 1:
+            old_delta = (native_controls['tail']['metrics']['fid_tweedie_vp'] -
+                         native_controls['vp']['metrics']['fid_tweedie_vp'])
+            new_delta = (cells['native_tail_nfe2000_seed0']['fid_tweedie_vp'] -
+                         cells['native_vp_nfe2000_seed0']['fid_tweedie_vp'])
+            result['contrasts']['native'] = dict(
+                tail_minus_vp_1000=old_delta, tail_minus_vp_2000=new_delta,
+                contrast_change_2000_minus_1000=new_delta-old_delta)
+        if group == 'controlled':
+            a = ab_controls['A']['metrics']['fid_tweedie_xt']
+            b = ab_controls['B']['metrics']['fid_tweedie_xt']
+            controlled = result['contrasts'].setdefault('controlled', dict(b_minus_a=b-a))
+            if route == 'head':
+                value = cells[folder]['fid_tweedie_a']
+                controlled.update(head_minus_a=value-a, head_minus_b=value-b)
+            else:
+                controlled.update(tail_minus_a=cells[folder]['fid_tweedie_b']-a,
+                                  tail_with_a_denoiser_minus_a=cells[folder]['fid_tweedie_a']-a)
+        result['completed_cells'] = index + 1
+        result['status'] = 'calculations_completed' if index == len(NEXT_QUEUE) - 1 else 'running'
+        publish_json(OUTPUT / 'summary.json', result)
+        gc.collect()
+    check_snapshot()
+    result['status'] = 'completed'
+    publish_json(OUTPUT / 'summary.json', result)
+
+
+def main():
+    if os.environ.get('SWAP_SELF_TEST') == '1':
+        self_test()
+        return
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        raise RuntimeError('Expected exactly one Docker-visible CUDA GPU.')
+    check_snapshot()
+    if digest(ROOT / REFERENCE) != REFERENCE_SHA:
+        raise RuntimeError('Unexpected fixed CelebA reference.')
+    config, fox_config = make_config(0, 'vp')
+    configure_reproducibility(config, tensorflow_module=tf)
+    # Read the exact pinned reference directly: inference needs no CelebA loader,
+    # and must never fall back to recomputing stats for another dataset path.
+    with np.load(str(ROOT / REFERENCE), allow_pickle=False) as archive:
+        reference = archive['pool_3'].copy()
+    if (reference.ndim != 2 or reference.shape[1] != 2048 or
+            reference.shape[0] < 2 or not np.isfinite(reference).all()):
+        raise RuntimeError('Invalid fixed reference features.')
+    plan = os.environ.get('SWAP_PLAN', 'swap')
+    if plan == 'next15h':
+        run_next15h(reference)
+        return
+    if plan != 'swap':
+        raise ValueError(f'Unknown plan: {plan}')
+    models, identities = {}, {}
+    for arm, cfg in (('vp', config), ('fox', fox_config)):
+        models[arm], identities[arm] = load_model(cfg, arm)
+    inception = evaluation.get_inception_model(inceptionv3=False)
+    results = {}
+    # Finish the full 2x2 comparison on seed 0 before starting seed 1.
+    for seed in (0, 1):
+        cells = {}
+        for route in ('vp', 'tail'):
+            logging.info('=== Denoiser swap route=%s seed=%s samples=%s ===', route, seed, COUNT)
+            cells[route] = evaluate_cell(seed, route, models['vp'], models['fox'], identities,
+                                         inception, reference)
+            gc.collect()
+        a, b = (cells['vp'][f'fid_{v}'] for v in VARIANTS)
+        c, d = (cells['tail'][f'fid_{v}'] for v in VARIANTS)
+        results[str(seed)] = dict(cells=cells, fid_contrasts=dict(
+            denoiser_on_vp=b-a, denoiser_on_tail=d-c, tail_with_vp_denoiser=c-a,
+            total_tail=d-a, interaction=(d-c)-(b-a)))
+        publish_json(OUTPUT / 'summary.json', dict(
+            status='completed' if seed == 1 else 'seed0_completed', num_samples=COUNT,
+            results=results, uncertainty='point estimates only; bootstrap not run'))
+    check_snapshot()
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', force=True)
+    main()
+PY_DENOISER_SWAP
+
+if [[ "${SWAP_SELF_TEST:-0}" != 1 ]]; then
+  printf 'completed\n' > /output/queue.state
+  echo "CelebA plan ${SWAP_PLAN:-swap} completed at $(date -Is)"
+fi

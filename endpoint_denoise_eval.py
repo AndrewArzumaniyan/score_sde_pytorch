@@ -38,6 +38,9 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
   if (config.data.dataset, config.data.image_size) not in (
       ('CELEBA', 64), ('CIFAR10', 32)):
     raise ValueError('Endpoint denoise evaluation supports CelebA 64 and CIFAR-10 32.')
+  variants = tuple(getattr(config.eval, 'endpoint_denoise_outputs', VARIANTS))
+  if variants not in (VARIANTS, ('x_t', 'tweedie_xt')):
+    raise ValueError('Unsupported endpoint output variants.')
   requested = int(config.eval.num_samples)
   batch_size = int(config.eval.batch_size)
   if requested <= 0 or batch_size <= 0:
@@ -45,13 +48,16 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
   rounds = int(math.ceil(requested / float(batch_size)))
   sample_dir = os.path.join(eval_dir, f'ckpt_{ckpt}')
   tf.io.gfile.makedirs(sample_dir)
-  pools = {variant: [] for variant in VARIANTS}
-  logits = {variant: [] for variant in VARIANTS}
+  pools = {variant: [] for variant in variants}
+  logits = {variant: [] for variant in variants}
   route_metadata = getattr(score_model, 'expected_route_metadata', None)
   route_keys = tuple(route_metadata) if route_metadata is not None else ()
-  sample_keys = tuple(f'samples_{variant}' for variant in VARIANTS) + ('nfe',) + route_keys
+  sample_keys = tuple(f'samples_{variant}' for variant in variants) + ('nfe',) + route_keys
+  save_float = bool(getattr(config.eval, 'save_endpoint_states', False))
+  if save_float:
+    sample_keys += ('float_x_t',)
   stat_keys = tuple(
-    key for variant in VARIANTS
+    key for variant in variants
     for key in (f'pool_3_{variant}', f'logits_{variant}')) + ('num_samples', 'nfe')
 
   for round_id in range(rounds):
@@ -71,14 +77,17 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
         outputs, nfe = sampling_fn(score_model)
       if route_metadata is not None:
         score_model.checked_route_metadata()
-      if set(outputs) != set(VARIANTS):
+      if set(outputs) != set(variants):
         raise ValueError(f'Unexpected E4 sampler outputs: {tuple(outputs)}')
       samples = {
         f'samples_{variant}': np.clip(
           outputs[variant].permute(0, 2, 3, 1).cpu().numpy() * 255.,
           0, 255).astype(np.uint8)
-        for variant in VARIANTS
+        for variant in variants
       }
+      if save_float:
+        # Unclipped float state in inverse-scaled data coordinates (NCHW).
+        samples['float_x_t'] = outputs['x_t'].detach().cpu().numpy().astype(np.float32)
       samples.update(nfe=np.asarray(nfe), round_id=np.asarray(round_id),
                      sampling_seed=np.asarray(seed), **artifact_identity)
       if route_metadata is not None:
@@ -91,7 +100,7 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
           raise ValueError(f'Incorrect splice route {key}: {sample_file}')
     if int(np.asarray(samples['nfe'])) != int(config.eval.sampling_num_scales) + 1:
       raise ValueError(f'Incorrect E4 network evaluation count: {sample_file}')
-    for variant in VARIANTS:
+    for variant in variants:
       image_batch = samples[f'samples_{variant}']
       if image_batch.shape != (batch_size, config.data.image_size,
                                config.data.image_size, config.data.num_channels):
@@ -109,7 +118,7 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
       stats = dict(round_id=np.asarray(round_id), sampling_seed=np.asarray(seed),
                    num_samples=np.asarray(batch_size),
                    nfe=np.asarray(samples['nfe']), **artifact_identity)
-      for variant in VARIANTS:
+      for variant in variants:
         gc.collect()
         result = evaluation.run_inception_distributed(
           samples[f'samples_{variant}'], inception_model)
@@ -119,7 +128,7 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
     if int(np.asarray(stats['num_samples'])) != batch_size or \
         int(np.asarray(stats['nfe'])) != int(np.asarray(samples['nfe'])):
       raise ValueError(f'Inconsistent E4 Inception batch: {stat_file}')
-    for variant in VARIANTS:
+    for variant in variants:
       pool = np.asarray(stats[f'pool_3_{variant}'])
       logit = np.asarray(stats[f'logits_{variant}'])
       if pool.shape[0] != batch_size or logit.shape[0] != batch_size:
@@ -141,7 +150,7 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
     report['splice_fox_calls_total'] = np.asarray(
       rounds * route_metadata['splice_fox_calls'])
   data_pools = data_stats['pool_3']
-  for variant in VARIANTS:
+  for variant in variants:
     all_pools = np.concatenate(pools[variant], axis=0)[:requested]
     all_logits = np.concatenate(logits[variant], axis=0)[:requested]
     report[f'IS_{variant}'] = np.asarray(
@@ -168,7 +177,7 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
         int(np.asarray(saved['num_samples'])) != requested or \
         int(np.asarray(saved['nfe'])) != int(np.asarray(report['nfe'])):
       raise ValueError(f'Cached E4 report uses different reference data: {report_path}')
-    for variant in VARIANTS:
+    for variant in variants:
       for metric in ('IS', 'fid', 'kid'):
         key = f'{metric}_{variant}'
         if not np.isclose(saved[key], report[key], rtol=1e-6, atol=1e-8):

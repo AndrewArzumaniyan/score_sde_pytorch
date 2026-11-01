@@ -6,11 +6,11 @@ gpu="${1:?Usage: bash run_e3b_final50k_docker.sh GPU_ID}"
 [[ $# == 1 && ( "$gpu" =~ ^[0-9]+$ || "$gpu" == GPU-* ) ]] || {
   echo 'Expected one physical GPU index or UUID.' >&2; exit 2; }
 main="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-output="${E3B_FINAL_OUTPUT:-$(dirname "$main")/e3b_final50k}"
+output="${E3B_FINAL_OUTPUT:-$(dirname "$main")/e3b_final50k_splices}"
 output="$(realpath -m "$output")"
 case "$output/" in "$main/"*|/) echo 'Output must be outside the source repository.' >&2; exit 2 ;; esac
 [[ ! -e "$output" ]] || { echo "Output already exists: $output; inspect/resume the existing container." >&2; exit 1; }
-name=e3b-final50k-seeds01
+name=e3b-final50k-splices-seeds01
 if docker inspect "$name" >/dev/null 2>&1; then
   echo "Container $name already exists; inspect it before restarting." >&2; exit 1
 fi

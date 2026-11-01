@@ -95,6 +95,17 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
 
   sampler_name = config.sampling.method
   endpoint_variants = bool(getattr(config.eval, 'endpoint_denoise_variants', False))
+  if sampler_name.lower() in ('ode_heun', 'ode_dpmpp_2m'):
+    from ode_sampling import get_vp_ode_sampler, VARIANTS
+    if (not endpoint_variants or not config.training.continuous or
+        not config.sampling.probability_flow or not config.sampling.noise_removal or
+        config.sampling.corrector.lower() != 'none' or
+        config.sampling.time_grid != 'uniform_logsnr' or
+        tuple(getattr(config.eval, 'endpoint_denoise_outputs', ())) != VARIANTS or
+        bool(getattr(config.eval, 'splice_enabled', False))):
+      raise ValueError('VP ODE methods require continuous PF-ODE, no corrector/splice, '
+                       'uniform-logSNR, explicit endpoint denoise and x_t/tweedie_xt outputs.')
+    return get_vp_ode_sampler(sde, shape, inverse_scaler, sampler_name.lower(), eps, config.device)
   if endpoint_variants and sampler_name.lower() != 'pc':
     raise ValueError('Endpoint denoise variants require the PC sampler.')
   if sampler_name.lower() == 'edm':
@@ -417,6 +428,19 @@ def shared_corrector_update_fn(x, t, sde, model, corrector, continuous, snr, n_s
   return corrector_obj.update_fn(x, t)
 
 
+def get_initial_sample(sde, shape, timesteps, device):
+  """Shared finite-endpoint Gaussian prior for PC and fixed-budget ODE sampling."""
+  x = sde.prior_sampling(shape).to(device)
+  lambda_min = getattr(sde, 'sampling_logsnr_min', None)
+  lambda_max = getattr(sde, 'sampling_logsnr_max', None)
+  if lambda_min is None and lambda_max is None:
+    return x
+  t0 = torch.full((shape[0],), timesteps[0].item(), device=device, dtype=x.dtype)
+  marginal_std = sde.marginal_prob(torch.zeros_like(x), t0)[1][0]
+  native_prior_std = float(getattr(sde, '_prior_std', 1.0))
+  return x * (marginal_std / native_prior_std)
+
+
 def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
                    n_steps=1, probability_flow=False, continuous=False,
                    denoise=True, time_grid='uniform_time', eps=1e-3,
@@ -467,22 +491,6 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
     return sde.sampling_time_grid(
       eps, grid=time_grid, device=device, dtype=torch.float32, N=sde.N + 1)
 
-  def get_initial_sample(timesteps):
-    x = sde.prior_sampling(shape).to(device)
-    lambda_min = getattr(sde, 'sampling_logsnr_min', None)
-    lambda_max = getattr(sde, 'sampling_logsnr_max', None)
-    if lambda_min is None and lambda_max is None:
-      return x
-    # A common finite terminal log-SNR generally starts before the native T.
-    # Use the Gaussian marginal's noise scale at that endpoint instead of the
-    # native prior scale.  As usual at low terminal SNR, the residual data mean
-    # is neglected by the Gaussian-prior approximation.
-    t0 = torch.full(
-      (shape[0],), timesteps[0].item(), device=device, dtype=x.dtype)
-    marginal_std = sde.marginal_prob(torch.zeros_like(x), t0)[1][0]
-    native_prior_std = float(getattr(sde, '_prior_std', 1.0))
-    return x * (marginal_std / native_prior_std)
-
   def pc_sampler(model):
     """ The PC sampler funciton.
 
@@ -494,7 +502,7 @@ def get_pc_sampler(sde, shape, predictor, corrector, inverse_scaler, snr,
     with torch.no_grad():
       # Initial sample
       timesteps = get_time_grid()
-      x = get_initial_sample(timesteps)
+      x = get_initial_sample(sde, shape, timesteps, device)
 
       for i in range(sde.N):
         t = timesteps[i]
