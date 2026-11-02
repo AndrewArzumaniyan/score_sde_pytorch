@@ -4,9 +4,14 @@
 # Controlled A/B with Heun and DPM++: bash ... --ode GPU_ID|--check
 # EDM ckpt-2, VP/FOX and A/B with the EDM sampler: bash ... --edm-protocol GPU_ID|--check
 # Final VP/FOX, Heun/DPM++, 16-256 calls, two seeds (10k): --final-ode-lownfe GPU_ID|--check
+# Native matched35, six new 50k cells, two reused EDM anchors: --matched35 GPU_ID|--check
 set -euo pipefail
 
 metadata() {
+if [[ "${CELEBA_QUEUE_PROFILE:-em}" == matched35 ]]; then
+  python -u celeba_matched35_eval.py "$@"
+  return
+fi
 if [[ "${CELEBA_QUEUE_PROFILE:-em}" == edm_protocol ]]; then
   python -u celeba_edm_protocol_eval.py "$@"
   return
@@ -226,14 +231,14 @@ if [[ "${1:-}" == _container ]]; then
     if [[ "${CELEBA_QUEUE_PROFILE:-em}" == edm_protocol ]]; then
       cell="${route}_ckpt${seed}_${method}_n${steps}"; log="/output/logs/${cell}.log"
     fi
-    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode_lownfe ]]; then
+    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode_lownfe || "${CELEBA_QUEUE_PROFILE:-em}" == matched35 ]]; then
       [[ "$sampling_seed" == 0 || "$sampling_seed" == 1 ]] || { echo 'Invalid sampling seed in low-NFE plan.' >&2; exit 2; }
       cell="${method}_n${steps}_${seed}samples_${route}_seed${sampling_seed}"
       log="/output/logs/${cell}.log"
     fi
     printf '%s\n' "$cell" > /output/logs/queue.state
     echo "=== Low NFE: $cell; $(date -u -Is) ==="
-    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode_lownfe ]]; then
+    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode_lownfe || "${CELEBA_QUEUE_PROFILE:-em}" == matched35 ]]; then
       metadata run "$steps" "$seed" "$route" "$method" "$sampling_seed" 2>&1 | tee "$log"
       metadata report "$steps" "$seed" "$route" "$method" "$sampling_seed"
     elif [[ "${CELEBA_QUEUE_PROFILE:-em}" == ode || "${CELEBA_QUEUE_PROFILE:-em}" == final_ode ||
@@ -256,10 +261,11 @@ if [[ "${1:-}" == --ode ]]; then export CELEBA_QUEUE_PROFILE=ode; shift; fi
 if [[ "${1:-}" == --final-ode ]]; then export CELEBA_QUEUE_PROFILE=final_ode; shift; fi
 if [[ "${1:-}" == --final-ode-lownfe ]]; then export CELEBA_QUEUE_PROFILE=final_ode_lownfe; shift; fi
 if [[ "${1:-}" == --edm-protocol ]]; then export CELEBA_QUEUE_PROFILE=edm_protocol; shift; fi
+if [[ "${1:-}" == --matched35 ]]; then export CELEBA_QUEUE_PROFILE=matched35; shift; fi
 profile="${CELEBA_QUEUE_PROFILE:-em}"
 [[ "$profile" == em || "$profile" == ode || "$profile" == final_ode || "$profile" == final_ode_lownfe ||
-   "$profile" == edm_protocol ]] || { echo 'Unknown queue profile.' >&2; exit 2; }
-[[ $# == 1 ]] || { echo 'Usage: bash run_celeba_low_nfe_overnight.sh [--ode|--final-ode|--final-ode-lownfe|--edm-protocol] GPU_ID|--check' >&2; exit 2; }
+   "$profile" == edm_protocol || "$profile" == matched35 ]] || { echo 'Unknown queue profile.' >&2; exit 2; }
+[[ $# == 1 ]] || { echo 'Usage: bash run_celeba_low_nfe_overnight.sh [--ode|--final-ode|--final-ode-lownfe|--edm-protocol|--matched35] GPU_ID|--check' >&2; exit 2; }
 main="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 launcher="$(basename "${BASH_SOURCE[0]}")"
 root=/workspace/score_sde_pytorch
@@ -280,6 +286,10 @@ fi
 if [[ "$profile" == edm_protocol ]]; then
   image="${CELEBA_EDM_PROTOCOL_IMAGE:-$image}"
   test_file=tests/check_celeba_edm_protocol.py
+fi
+if [[ "$profile" == matched35 ]]; then
+  image="${CELEBA_FINAL_ODE_IMAGE:-$image}"
+  test_file=tests/check_celeba_matched35.py
 fi
 if [[ "$1" == --check ]]; then
   exec docker run --rm --network none --cpus 2 --memory 4g \
@@ -320,21 +330,30 @@ if [[ "$profile" == ode ]]; then
     done
   done
 fi
-if [[ "$profile" == final_ode || "$profile" == final_ode_lownfe ]]; then
+if [[ "$profile" == final_ode || "$profile" == final_ode_lownfe || "$profile" == matched35 ]]; then
   data_repo="$(realpath -e "${CELEBA_FINAL_ODE_INPUT_REPO:-$main}")"
   parent="$(dirname "$data_repo")"
   if [[ "$profile" == final_ode ]]; then
     output="$(realpath -m "${CELEBA_FINAL_ODE_OUTPUT:-$parent/celeba_final_ode_20261031}")"
     name="${CELEBA_FINAL_ODE_CONTAINER:-celeba-final-ode-20261031}"
-  else
+  elif [[ "$profile" == final_ode_lownfe ]]; then
     output="$(realpath -m "${CELEBA_FINAL_ODE_LOWNFE_OUTPUT:-$parent/celeba_final_ode_lownfe_20261102}")"
     name="${CELEBA_FINAL_ODE_LOWNFE_CONTAINER:-celeba-final-ode-lownfe-20261102}"
+  else
+    output="$(realpath -m "${CELEBA_MATCHED35_OUTPUT:-$parent/celeba_matched35_20261102}")"
+    name="${CELEBA_MATCHED35_CONTAINER:-celeba-matched35-20261102}"
   fi
   input_mounts=(--mount "type=bind,src=$data_repo,dst=/inputs/repo,readonly")
   for arm in celeba_vp_continuous_50k celeba_fox_matern32_kappa1000_50k; do
     [[ -s "$data_repo/workdirs/$arm/checkpoints/checkpoint_260.pth" ]] || { echo "Missing checkpoint: $arm" >&2; exit 1; }
     checkpoint_mounts+=(--mount "type=bind,src=$data_repo/workdirs/$arm/checkpoints,dst=$root/workdirs/$arm/checkpoints,readonly")
   done
+  if [[ "$profile" == matched35 ]]; then
+    anchors="$(realpath -e "${CELEBA_MATCHED35_ANCHORS:-$parent/celeba_edm_protocol_20261101}")"
+    [[ -s "$anchors/snapshot.json" && -s "$anchors/logs/preflight.json" ]] || { echo 'Missing EDM anchor metadata.' >&2; exit 1; }
+    input_mounts+=(--mount "type=bind,src=$anchors,dst=/inputs/edm35,readonly")
+    extra_args+=(--mount "type=bind,src=$anchors,dst=/inputs/edm35,readonly")
+  fi
 fi
 if [[ "$profile" == edm_protocol ]]; then
   data_repo="$(realpath -e "${CELEBA_EDM_PROTOCOL_INPUT_REPO:-$main}")"
@@ -404,6 +423,9 @@ elif [[ "$profile" == final_ode ]]; then
 elif [[ "$profile" == final_ode_lownfe ]]; then
   required+=(celeba_final_ode_lownfe_eval.py celeba_final_ode_eval.py ode_sampling.py)
   git ls-files --error-unmatch celeba_final_ode_lownfe_eval.py celeba_final_ode_eval.py ode_sampling.py >/dev/null
+elif [[ "$profile" == matched35 ]]; then
+  required+=(celeba_matched35_eval.py celeba_final_ode_eval.py ode_sampling.py)
+  git ls-files --error-unmatch celeba_matched35_eval.py celeba_final_ode_eval.py ode_sampling.py >/dev/null
 else
   required+=(celeba_edm_protocol_eval.py celeba_final_ode_eval.py celeba_ode_eval.py ode_sampling.py)
   git ls-files --error-unmatch celeba_edm_protocol_eval.py celeba_final_ode_eval.py celeba_ode_eval.py ode_sampling.py >/dev/null
@@ -421,6 +443,7 @@ available="$(df -PB1 "$parent" | awk 'NR==2 {print $4}')"
 minimum_gib=25; [[ "$profile" != ode ]] || minimum_gib=40
 [[ "$profile" != final_ode && "$profile" != edm_protocol ]] || minimum_gib=70
 [[ "$profile" != final_ode_lownfe ]] || minimum_gib=120
+[[ "$profile" != matched35 ]] || minimum_gib=80
 (( available >= minimum_gib * 1024 * 1024 * 1024 )) || { echo "Need at least $minimum_gib GiB free for this queue." >&2; exit 1; }
 mkdir "$output"
 mkdir -p "$data_repo/.tfds" "$data_repo/.torch_extensions" "$data_repo/.cache"
