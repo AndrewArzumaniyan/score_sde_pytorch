@@ -99,13 +99,20 @@ def check_ncsnpp_protocol(config, arm, folder):
         require(sampling.get(key) == expected,
                 '%s: expected sampling.%s=%r' % (folder, key, expected))
     ev = config['eval']
-    require(ev.get('sampling_num_scales') == 64
-            and ev.get('enable_sampling') is True
-            and ev.get('enable_loss') is False and ev.get('enable_bpd') is False
-            and ev.get('begin_ckpt') == CHECKPOINT and ev.get('end_ckpt') == CHECKPOINT
-            and tuple(ev.get('endpoint_denoise_outputs', ())) == VARIANTS
-            and ev.get('save_endpoint_states') is True,
-            'Expected DPM++ 2M 64+1 with saved x_t/Tweedie outputs: ' + str(folder))
+    # build_eval_manifest deliberately excludes begin_ckpt/end_ckpt: they
+    # describe queue orchestration, not the contents of this checkpoint eval.
+    # The actual checkpoint is checked through report/statistics identities,
+    # state.step=600001 and the pinned VP/FOX checkpoint IDs below.
+    expected_eval = dict(sampling_num_scales=64, enable_sampling=True,
+                         enable_loss=False, enable_bpd=False,
+                         endpoint_denoise_variants=True, save_endpoint_states=True)
+    for key, expected in expected_eval.items():
+        require(ev.get(key) == expected,
+                '%s: expected eval.%s=%r, got %r' %
+                (folder, key, expected, ev.get(key)))
+    require(tuple(ev.get('endpoint_denoise_outputs', ())) == VARIANTS,
+            '%s: expected eval.endpoint_denoise_outputs=%r, got %r' %
+            (folder, VARIANTS, ev.get('endpoint_denoise_outputs')))
     driver_hash = ev.get('ode_driver_sha256')
     require(isinstance(driver_hash, str) and len(driver_hash) == 64
             and all(c in '0123456789abcdef' for c in driver_hash),
