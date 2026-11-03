@@ -295,20 +295,42 @@ def main():
             del state, optimizer, ema
             # Reproduce the ODE's coefficient/grid precision and native score scaling.
             sde, eps = run_lib.get_sde(cfg, n_override=64)
-            grid = sde.sampling_time_grid(eps, grid='uniform_logsnr', device=cfg.device,
-                                          dtype=torch.float64, N=65).to(torch.float32)
+            grid64 = sde.sampling_time_grid(eps, grid='uniform_logsnr', device=cfg.device,
+                                            dtype=torch.float64, N=65)
+            # Validate the inverse using the stable schedule in float64. Near
+            # clean VP, marginal_prob's FP32 1-exp(2*log_alpha) loses relative
+            # precision: lambda reconstructed from those sampler coefficients
+            # can differ by >2e-4 even though time inversion is correct.
+            requested_lambda = float(cfg.sampling.logsnr_max)
+            schedule_lambda = float(sde.log_snr(grid64[-1:])[0])
+            require(math.isfinite(schedule_lambda) and abs(schedule_lambda - requested_lambda) < 2e-6,
+                    f'Endpoint inversion mismatch: {arm}; requested={requested_lambda:.12g}, '
+                    f'stable_float64={schedule_lambda:.12g}, time={float(grid64[-1]):.12g}')
+            grid = grid64.to(torch.float32)
+            rounded_time_lambda = float(sde.log_snr(grid[-1:].to(torch.float64))[0])
             ones = torch.ones((65, 1, 1, 1), device=cfg.device, dtype=torch.float32)
             native_alpha, native_sigma = sde.marginal_prob(ones, grid)
             native_alpha = native_alpha.flatten()
             scale = torch.sqrt(native_alpha.square() + native_sigma.square())
             alpha, sigma = native_alpha / scale, native_sigma / scale
             score_fn = mutils.get_score_fn(sde, model, train=False, continuous=True)
+            # Keep these FP32 coefficients EXACTLY as in ode_sampling.py;
+            # replacing them by more accurate coefficients would change the
+            # historical full-Tweedie operator that this test must reproduce.
             actual_lambda = float(2*torch.log(alpha[-1] / sigma[-1]))
-            require(abs(actual_lambda - 10.575749165617202) < 2e-4, 'Endpoint inversion mismatch: ' + arm)
+            require(math.isfinite(actual_lambda) and math.isfinite(rounded_time_lambda),
+                    'Non-finite endpoint coefficients: ' + arm)
+            print(f'{arm} endpoint: requested={requested_lambda:.9f}; '
+                  f'stable_float64={schedule_lambda:.9f}; '
+                  f'from_original_fp32_coefficients={actual_lambda:.9f}', flush=True)
             pools, logits = {k: [] for k in WEIGHTS}, {k: [] for k in WEIGHTS}
             diagnostics, reproduction = {}, []
             arm_progress = dict(status='running', completed_rounds=0,
-                                endpoint=dict(native_time=float(grid[-1]), lambda_actual=actual_lambda,
+                                endpoint=dict(native_time=float(grid[-1]), native_time_float64=float(grid64[-1]),
+                                              lambda_requested=requested_lambda,
+                                              lambda_actual=schedule_lambda,
+                                              lambda_at_float32_time_stable=rounded_time_lambda,
+                                              lambda_from_fp32_sampler_coefficients=actual_lambda,
                                               native_alpha=float(native_alpha[-1]),
                                               native_scale=float(scale[-1]), normalized_sigma=float(sigma[-1])))
             result['arms'][arm] = arm_progress
