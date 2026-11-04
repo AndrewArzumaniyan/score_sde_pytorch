@@ -61,7 +61,7 @@ for arm in ARMS:
         digest.update(key.encode() + b'\0' + tensor.detach().cpu().contiguous().numpy().tobytes())
     audit['arms'][arm] = dict(drift_a=config.model.fox_drift_a,
                               normalize_scale=config.model.fox_normalize_scale,
-                              logsnr_at_1e-5_1e-3_1=lam, initial_state_sha256=digest.hexdigest())
+                              logsnr_at_t_1e5_1e3_1=lam, initial_state_sha256=digest.hexdigest())
     del model; gc.collect(); torch.cuda.empty_cache()
 if len({run['initial_state_sha256'] for run in audit['arms'].values()}) != 1:
     raise RuntimeError('Arms do not share the initial weights.')
