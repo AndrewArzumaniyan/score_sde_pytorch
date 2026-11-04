@@ -2,11 +2,32 @@
 # Host: bash run_celeba_low_nfe_overnight.sh GPU_ID
 # CPU-only local checks: CELEBA_LOW_NFE_IMAGE=IMAGE bash ... --check
 # Controlled A/B with Heun and DPM++: bash ... --ode GPU_ID|--check
+# EDM ckpt-2, VP/FOX and A/B with the EDM sampler: bash ... --edm-protocol GPU_ID|--check
+# Final VP/FOX, Heun/DPM++, 16-256 calls, two seeds (10k): --final-ode-lownfe GPU_ID|--check
+# Native matched35, six new 50k cells, two reused EDM anchors: --matched35 GPU_ID|--check
+# Matched35 on RTX PRO 6000, all eight cells, H200 anchors as reference: --matched35-rtx GPU_ID|--check
+# RTX smoke, one 1024-image EDM Heun cell compared with H200 row by row: --matched35-rtx-smoke GPU_ID
 set -euo pipefail
 
 metadata() {
+if [[ "${CELEBA_QUEUE_PROFILE:-em}" == matched35_rtx || "${CELEBA_QUEUE_PROFILE:-em}" == matched35_rtx_smoke ]]; then
+  python -u celeba_matched35_rtx_eval.py "$@"
+  return
+fi
+if [[ "${CELEBA_QUEUE_PROFILE:-em}" == matched35 ]]; then
+  python -u celeba_matched35_eval.py "$@"
+  return
+fi
+if [[ "${CELEBA_QUEUE_PROFILE:-em}" == edm_protocol ]]; then
+  python -u celeba_edm_protocol_eval.py "$@"
+  return
+fi
 if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode ]]; then
   python -u celeba_final_ode_eval.py "$@"
+  return
+fi
+if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode_lownfe ]]; then
+  python -u celeba_final_ode_lownfe_eval.py "$@"
   return
 fi
 if [[ "${CELEBA_QUEUE_PROFILE:-em}" == ode ]]; then
@@ -209,14 +230,26 @@ if [[ "${1:-}" == _container ]]; then
   export E3B_SPLICE_ALLOW_TF32=True E3B_SPLICE_CUDNN_BENCHMARK=True
   export E3B_SPLICE_VP_WORKDIR=workdirs/celeba_vp_continuous_50k
   export E3B_SPLICE_FOX_WORKDIR=workdirs/celeba_fox_matern32_kappa1000_50k
-  while read -r steps seed route method; do
+  while read -r steps seed route method sampling_seed; do
     metadata check
     cell="${method:+${method}_}n${steps}_seed${seed}_${route}"
+    log="/output/logs/${method}_n${steps}_train${seed}_${route}.log"
+    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == edm_protocol ]]; then
+      cell="${route}_ckpt${seed}_${method}_n${steps}"; log="/output/logs/${cell}.log"
+    fi
+    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode_lownfe || "${CELEBA_QUEUE_PROFILE:-em}" == matched35* ]]; then
+      [[ "$sampling_seed" == 0 || "$sampling_seed" == 1 ]] || { echo 'Invalid sampling seed in low-NFE plan.' >&2; exit 2; }
+      cell="${method}_n${steps}_${seed}samples_${route}_seed${sampling_seed}"
+      log="/output/logs/${cell}.log"
+    fi
     printf '%s\n' "$cell" > /output/logs/queue.state
     echo "=== Low NFE: $cell; $(date -u -Is) ==="
-    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == ode || "${CELEBA_QUEUE_PROFILE:-em}" == final_ode ]]; then
-      metadata run "$steps" "$seed" "$route" "$method" \
-        2>&1 | tee "/output/logs/${method}_n${steps}_train${seed}_${route}.log"
+    if [[ "${CELEBA_QUEUE_PROFILE:-em}" == final_ode_lownfe || "${CELEBA_QUEUE_PROFILE:-em}" == matched35* ]]; then
+      metadata run "$steps" "$seed" "$route" "$method" "$sampling_seed" 2>&1 | tee "$log"
+      metadata report "$steps" "$seed" "$route" "$method" "$sampling_seed"
+    elif [[ "${CELEBA_QUEUE_PROFILE:-em}" == ode || "${CELEBA_QUEUE_PROFILE:-em}" == final_ode ||
+          "${CELEBA_QUEUE_PROFILE:-em}" == edm_protocol ]]; then
+      metadata run "$steps" "$seed" "$route" "$method" 2>&1 | tee "$log"
       metadata report "$steps" "$seed" "$route" "$method"
     else
       E3B_SPLICE_RUNS="$route" E3B_SPLICE_STEPS="$steps" E3B_SPLICE_SEED="$seed" \
@@ -232,9 +265,16 @@ fi
 
 if [[ "${1:-}" == --ode ]]; then export CELEBA_QUEUE_PROFILE=ode; shift; fi
 if [[ "${1:-}" == --final-ode ]]; then export CELEBA_QUEUE_PROFILE=final_ode; shift; fi
+if [[ "${1:-}" == --final-ode-lownfe ]]; then export CELEBA_QUEUE_PROFILE=final_ode_lownfe; shift; fi
+if [[ "${1:-}" == --edm-protocol ]]; then export CELEBA_QUEUE_PROFILE=edm_protocol; shift; fi
+if [[ "${1:-}" == --matched35 ]]; then export CELEBA_QUEUE_PROFILE=matched35; shift; fi
+if [[ "${1:-}" == --matched35-rtx ]]; then export CELEBA_QUEUE_PROFILE=matched35_rtx; shift; fi
+if [[ "${1:-}" == --matched35-rtx-smoke ]]; then export CELEBA_QUEUE_PROFILE=matched35_rtx_smoke; shift; fi
 profile="${CELEBA_QUEUE_PROFILE:-em}"
-[[ "$profile" == em || "$profile" == ode || "$profile" == final_ode ]] || { echo 'Unknown queue profile.' >&2; exit 2; }
-[[ $# == 1 ]] || { echo 'Usage: bash run_celeba_low_nfe_overnight.sh [--ode] GPU_ID|--check' >&2; exit 2; }
+[[ "$profile" == em || "$profile" == ode || "$profile" == final_ode || "$profile" == final_ode_lownfe ||
+   "$profile" == edm_protocol || "$profile" == matched35 || "$profile" == matched35_rtx ||
+   "$profile" == matched35_rtx_smoke ]] || { echo 'Unknown queue profile.' >&2; exit 2; }
+[[ $# == 1 ]] || { echo 'Usage: bash run_celeba_low_nfe_overnight.sh [--ode|--final-ode|--final-ode-lownfe|--edm-protocol|--matched35|--matched35-rtx|--matched35-rtx-smoke] GPU_ID|--check' >&2; exit 2; }
 main="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 launcher="$(basename "${BASH_SOURCE[0]}")"
 root=/workspace/score_sde_pytorch
@@ -247,6 +287,25 @@ fi
 if [[ "$profile" == final_ode ]]; then
   image="${CELEBA_FINAL_ODE_IMAGE:-$image}"
   test_file=tests/check_celeba_final_ode.py
+fi
+if [[ "$profile" == final_ode_lownfe ]]; then
+  image="${CELEBA_FINAL_ODE_IMAGE:-$image}"
+  test_file=tests/check_celeba_final_ode_lownfe.py
+fi
+if [[ "$profile" == edm_protocol ]]; then
+  image="${CELEBA_EDM_PROTOCOL_IMAGE:-$image}"
+  test_file=tests/check_celeba_edm_protocol.py
+fi
+if [[ "$profile" == matched35 ]]; then
+  image="${CELEBA_FINAL_ODE_IMAGE:-$image}"
+  test_file=tests/check_celeba_matched35.py
+fi
+# RTX PRO 6000 (sm_120) needs its own image, architecture and JIT/cache directories.
+rtx_suffix=''
+if [[ "$profile" == matched35_rtx || "$profile" == matched35_rtx_smoke ]]; then
+  image="${CELEBA_RTX_IMAGE:-score-sde-rtx:latest}"
+  test_file=tests/check_celeba_matched35_rtx.py
+  rtx_suffix=_rtx
 fi
 if [[ "$1" == --check ]]; then
   exec docker run --rm --network none --cpus 2 --memory 4g \
@@ -261,6 +320,7 @@ name="${CELEBA_LOW_NFE_CONTAINER:-celeba-low-nfe-overnight-20261029}"
 data_repo="$main"
 input_mounts=()
 checkpoint_mounts=()
+extra_args=()
 if [[ "$profile" == ode ]]; then
   data_repo="$(realpath -e "${CELEBA_ODE_INPUT_REPO:-$main}")"
   parent="$(dirname "$data_repo")"
@@ -286,16 +346,66 @@ if [[ "$profile" == ode ]]; then
     done
   done
 fi
-if [[ "$profile" == final_ode ]]; then
+if [[ "$profile" == final_ode || "$profile" == final_ode_lownfe || "$profile" == matched35* ]]; then
   data_repo="$(realpath -e "${CELEBA_FINAL_ODE_INPUT_REPO:-$main}")"
   parent="$(dirname "$data_repo")"
-  output="$(realpath -m "${CELEBA_FINAL_ODE_OUTPUT:-$parent/celeba_final_ode_20261031}")"
-  name="${CELEBA_FINAL_ODE_CONTAINER:-celeba-final-ode-20261031}"
+  if [[ "$profile" == final_ode ]]; then
+    output="$(realpath -m "${CELEBA_FINAL_ODE_OUTPUT:-$parent/celeba_final_ode_20261031}")"
+    name="${CELEBA_FINAL_ODE_CONTAINER:-celeba-final-ode-20261031}"
+  elif [[ "$profile" == final_ode_lownfe ]]; then
+    output="$(realpath -m "${CELEBA_FINAL_ODE_LOWNFE_OUTPUT:-$parent/celeba_final_ode_lownfe_20261102}")"
+    name="${CELEBA_FINAL_ODE_LOWNFE_CONTAINER:-celeba-final-ode-lownfe-20261102}"
+  elif [[ "$profile" == matched35_rtx ]]; then
+    output="$(realpath -m "${CELEBA_MATCHED35_RTX_OUTPUT:-$parent/celeba_matched35_rtx_20261103}")"
+    name="${CELEBA_MATCHED35_RTX_CONTAINER:-celeba-matched35-rtx-20261103}"
+  elif [[ "$profile" == matched35_rtx_smoke ]]; then
+    output="$(realpath -m "${CELEBA_MATCHED35_RTX_OUTPUT:-$parent/celeba_matched35_rtx_smoke_20261103}")"
+    name="${CELEBA_MATCHED35_RTX_CONTAINER:-celeba-matched35-rtx-smoke-20261103}"
+  else
+    output="$(realpath -m "${CELEBA_MATCHED35_OUTPUT:-$parent/celeba_matched35_20261102}")"
+    name="${CELEBA_MATCHED35_CONTAINER:-celeba-matched35-20261102}"
+  fi
   input_mounts=(--mount "type=bind,src=$data_repo,dst=/inputs/repo,readonly")
   for arm in celeba_vp_continuous_50k celeba_fox_matern32_kappa1000_50k; do
     [[ -s "$data_repo/workdirs/$arm/checkpoints/checkpoint_260.pth" ]] || { echo "Missing checkpoint: $arm" >&2; exit 1; }
     checkpoint_mounts+=(--mount "type=bind,src=$data_repo/workdirs/$arm/checkpoints,dst=$root/workdirs/$arm/checkpoints,readonly")
   done
+  if [[ "$profile" == matched35* ]]; then
+    anchors="$(realpath -e "${CELEBA_MATCHED35_ANCHORS:-$parent/celeba_edm_protocol_20261101}")"
+    [[ -s "$anchors/snapshot.json" && -s "$anchors/logs/preflight.json" ]] || { echo 'Missing EDM anchor metadata.' >&2; exit 1; }
+    input_mounts+=(--mount "type=bind,src=$anchors,dst=/inputs/edm35,readonly")
+    extra_args+=(--mount "type=bind,src=$anchors,dst=/inputs/edm35,readonly")
+  fi
+fi
+if [[ "$profile" == edm_protocol ]]; then
+  data_repo="$(realpath -e "${CELEBA_EDM_PROTOCOL_INPUT_REPO:-$main}")"
+  parent="$(dirname "$data_repo")"
+  ab43="$(realpath -e "${CELEBA_EDM_PROTOCOL_SEED43_ROOT:-$parent/ab_replication_seed43}")"
+  ab44="$(realpath -e "${CELEBA_EDM_PROTOCOL_SEED44_ROOT:-$parent/ab_replication_seed44}")"
+  output="$(realpath -m "${CELEBA_EDM_PROTOCOL_OUTPUT:-$parent/celeba_edm_protocol_20261101}")"
+  name="${CELEBA_EDM_PROTOCOL_CONTAINER:-celeba-edm-protocol-20261101}"
+  input_mounts=(--mount "type=bind,src=$data_repo,dst=/inputs/repo,readonly"
+    --mount "type=bind,src=$ab43,dst=/inputs/seed43,readonly"
+    --mount "type=bind,src=$ab44,dst=/inputs/seed44,readonly")
+  # Each weights directory once; the queue reads only the checkpoints pinned at snapshot.
+  for spec in "$data_repo:celeba_edm_canonical_50k:2" "$data_repo:celeba_vp_continuous_50k:20 260" \
+      "$data_repo:celeba_fox_matern32_kappa1000_50k:20 260" \
+      "$data_repo:celeba_factorial_A_vp_pvp_50k:40" "$data_repo:celeba_factorial_B_vp_pfox_50k:40" \
+      "$ab43:celeba_ab_replication_A_vp_pvp_seed43_200k:4" "$ab43:celeba_ab_replication_B_vp_pfox_seed43_200k:4" \
+      "$ab44:celeba_ab_replication_A_vp_pvp_seed44_200k:4" "$ab44:celeba_ab_replication_B_vp_pfox_seed44_200k:4"; do
+    origin="${spec%%:*}"; rest="${spec#*:}"; work="${rest%%:*}"
+    for ckpt in ${rest#*:}; do
+      [[ -s "$origin/workdirs/$work/checkpoints/checkpoint_${ckpt}.pth" ]] || { echo "Missing checkpoint: $work/$ckpt" >&2; exit 1; }
+    done
+    if [[ "$work" == *_A_* || "$work" == *_B_* ]]; then
+      [[ -s "$origin/workdirs/$work/run_manifest.json" ]] || { echo "Missing training manifest: $work" >&2; exit 1; }
+    fi
+    checkpoint_mounts+=(--mount "type=bind,src=$origin/workdirs/$work/checkpoints,dst=$root/workdirs/$work/checkpoints,readonly")
+  done
+  # The adapter verifies the pinned official commit with Git; the frozen runtime has no .git.
+  edm_official="$data_repo/third_party/edm"
+  [[ -d "$edm_official/.git" && -s "$edm_official/training/networks.py" ]] || { echo "Missing official EDM checkout: $edm_official" >&2; exit 1; }
+  extra_args=(--mount "type=bind,src=$edm_official,dst=/opt/edm,readonly" --env EDM_OFFICIAL_ROOT=/opt/edm)
 fi
 [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo 'Invalid container name.' >&2; exit 2; }
 case "$output/" in "$main/"*|/) echo 'Output must be outside the source repository.' >&2; exit 2 ;; esac
@@ -306,12 +416,12 @@ if docker inspect "$name" >/dev/null 2>&1; then
   echo "Container exists: $name; inspect it before restarting." >&2; exit 1
 fi
 tfds="${TFDS_DATA_DIR:-$root/.tfds}"
-extensions="${TORCH_EXTENSIONS_DIR:-$root/.torch_extensions}"
-cache="${XDG_CACHE_HOME:-$root/.cache}"
+extensions="${TORCH_EXTENSIONS_DIR:-$root/.torch_extensions$rtx_suffix}"
+cache="${XDG_CACHE_HOME:-$root/.cache$rtx_suffix}"
 for path in "$tfds" "$extensions" "$cache"; do
   [[ "$path" == /* && "$path" != *','* && "$path" != *'..'* ]] || { echo "Invalid cache path: $path" >&2; exit 2; }
   case "$path/" in
-    "$root/.tfds/"|"$root/.torch_extensions/"|"$root/.cache/") ;;
+    "$root/.tfds/"|"$root/.torch_extensions/"|"$root/.cache/"|"$root/.torch_extensions_rtx/"|"$root/.cache_rtx/") ;;
     "$root/"*|/|/workspace/|/output/|/output/*|/opt/|/opt/*|/tmp/|/usr/*|/etc/*|/proc/*|/dev/*|/sys/*|/bin/*|/sbin/*|/lib/*|/lib64/*)
       echo "Cache overlaps runtime/system directories: $path" >&2; exit 2 ;;
   esac
@@ -329,9 +439,21 @@ if [[ "$profile" == em ]]; then
 elif [[ "$profile" == ode ]]; then
   required+=(celeba_ode_eval.py ode_sampling.py)
   git ls-files --error-unmatch celeba_ode_eval.py ode_sampling.py >/dev/null
-else
+elif [[ "$profile" == final_ode ]]; then
   required+=(celeba_final_ode_eval.py ode_sampling.py)
   git ls-files --error-unmatch celeba_final_ode_eval.py ode_sampling.py >/dev/null
+elif [[ "$profile" == final_ode_lownfe ]]; then
+  required+=(celeba_final_ode_lownfe_eval.py celeba_final_ode_eval.py ode_sampling.py)
+  git ls-files --error-unmatch celeba_final_ode_lownfe_eval.py celeba_final_ode_eval.py ode_sampling.py >/dev/null
+elif [[ "$profile" == matched35 ]]; then
+  required+=(celeba_matched35_eval.py celeba_final_ode_eval.py ode_sampling.py)
+  git ls-files --error-unmatch celeba_matched35_eval.py celeba_final_ode_eval.py ode_sampling.py >/dev/null
+elif [[ "$profile" == matched35_rtx* ]]; then
+  required+=(celeba_matched35_rtx_eval.py celeba_matched35_eval.py celeba_final_ode_eval.py ode_sampling.py)
+  git ls-files --error-unmatch celeba_matched35_rtx_eval.py celeba_matched35_eval.py celeba_final_ode_eval.py ode_sampling.py >/dev/null
+else
+  required+=(celeba_edm_protocol_eval.py celeba_final_ode_eval.py celeba_ode_eval.py ode_sampling.py)
+  git ls-files --error-unmatch celeba_edm_protocol_eval.py celeba_final_ode_eval.py celeba_ode_eval.py ode_sampling.py >/dev/null
 fi
 for path in "${required[@]}"; do
   [[ -s "$path" ]] || { echo "Missing input: $path" >&2; exit 1; }
@@ -339,15 +461,20 @@ done
 [[ -d "$data_repo/celeba/img_align_celeba" ]] || { echo 'Missing CelebA images.' >&2; exit 1; }
 git ls-files --error-unmatch "$launcher" run_e3b_splice_eval.sh >/dev/null
 image_id="$(docker image inspect --format '{{.Id}}' "$image")"
-# About 14 GB of uncompressed images/features, plus runtime and filesystem overhead.
+# Space for images, both endpoint outputs/states, features and runtime overhead.
 parent="$(dirname "$output")"
 [[ -d "$parent" ]] || { echo "Output parent must exist: $parent" >&2; exit 2; }
 available="$(df -PB1 "$parent" | awk 'NR==2 {print $4}')"
 minimum_gib=25; [[ "$profile" != ode ]] || minimum_gib=40
-[[ "$profile" != final_ode ]] || minimum_gib=70
+[[ "$profile" != final_ode && "$profile" != edm_protocol ]] || minimum_gib=70
+[[ "$profile" != final_ode_lownfe ]] || minimum_gib=120
+[[ "$profile" != matched35 && "$profile" != matched35_rtx ]] || minimum_gib=80
+[[ "$profile" != matched35_rtx_smoke ]] || minimum_gib=5
 (( available >= minimum_gib * 1024 * 1024 * 1024 )) || { echo "Need at least $minimum_gib GiB free for this queue." >&2; exit 1; }
 mkdir "$output"
-mkdir -p "$data_repo/.tfds" "$data_repo/.torch_extensions" "$data_repo/.cache"
+mkdir -p "$data_repo/.tfds" "$data_repo/.torch_extensions$rtx_suffix" "$data_repo/.cache$rtx_suffix"
+arch="${TORCH_CUDA_ARCH_LIST:-9.0}"
+[[ -z "$rtx_suffix" ]] || arch="${TORCH_CUDA_ARCH_LIST:-12.0}"
 docker run --rm --network none --user "$(id -u):$(id -g)" \
   --mount "type=bind,src=$main,dst=/source,readonly" \
   --mount "type=bind,src=$output,dst=/output" --workdir /source \
@@ -356,8 +483,8 @@ docker run --rm --network none --user "$(id -u):$(id -g)" \
   "/source/$launcher" _meta snapshot /source /output
 git rev-parse HEAD > "$output/commit.txt"
 git status --porcelain > "$output/source_status.txt"
-printf 'image=%s\nphysical_gpu=%s\nTFDS_DATA_DIR=%s\nTORCH_EXTENSIONS_DIR=%s\nXDG_CACHE_HOME=%s\n' \
-  "$image_id" "$gpu" "$tfds" "$extensions" "$cache" > "$output/docker.txt"
+printf 'image=%s\nphysical_gpu=%s\nTFDS_DATA_DIR=%s\nTORCH_EXTENSIONS_DIR=%s\nXDG_CACHE_HOME=%s\nTORCH_CUDA_ARCH_LIST=%s\n' \
+  "$image_id" "$gpu" "$tfds" "$extensions" "$cache" "$arch" > "$output/docker.txt"
 for path in "$tfds" "$extensions" "$cache"; do
   case "$path" in "$root"/*) mkdir -p "$output/runtime/${path#"$root"/}" ;; esac
 done
@@ -369,19 +496,19 @@ args=(run -d --name "$name" --gpus "device=$gpu" --ipc=host
   --mount "type=bind,src=$output,dst=/output"
   --mount "type=bind,src=$data_repo/celeba,dst=$root/celeba,readonly"
   --mount "type=bind,src=$data_repo/.tfds,dst=$tfds"
-  --mount "type=bind,src=$data_repo/.torch_extensions,dst=$extensions"
-  --mount "type=bind,src=$data_repo/.cache,dst=$cache"
+  --mount "type=bind,src=$data_repo/.torch_extensions$rtx_suffix,dst=$extensions"
+  --mount "type=bind,src=$data_repo/.cache$rtx_suffix,dst=$cache"
   --workdir "$root" --env CUDA_VISIBLE_DEVICES=0 --env PYTHONDONTWRITEBYTECODE=1
   --env CELEBA_QUEUE_PROFILE="$profile"
   --env TFDS_DATA_DIR="$tfds" --env TORCH_EXTENSIONS_DIR="$extensions" --env XDG_CACHE_HOME="$cache"
-  --env TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}" --env MAX_JOBS="${MAX_JOBS:-8}"
+  --env TORCH_CUDA_ARCH_LIST="$arch" --env MAX_JOBS="${MAX_JOBS:-8}"
   --entrypoint bash)
 if [[ "$profile" == em ]]; then
   for arm in celeba_vp_continuous_50k celeba_fox_matern32_kappa1000_50k; do
     checkpoint_mounts+=(--mount "type=bind,src=$main/workdirs/$arm/checkpoints,dst=$root/workdirs/$arm/checkpoints,readonly")
   done
 fi
-args+=("${checkpoint_mounts[@]}")
+args+=("${checkpoint_mounts[@]}" "${extra_args[@]}")
 docker "${args[@]}" "$image_id" "$launcher" _container
 docker inspect "$name" > "$output/docker_inspect_start.json"
 printf 'Started %s (profile=%s) on physical GPU %s. Night-sized queue; refine ETA from cell logs.\n' "$name" "$profile" "$gpu"

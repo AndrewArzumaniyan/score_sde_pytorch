@@ -95,16 +95,17 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
 
   sampler_name = config.sampling.method
   endpoint_variants = bool(getattr(config.eval, 'endpoint_denoise_variants', False))
-  if sampler_name.lower() in ('ode_heun', 'ode_dpmpp_2m'):
-    from ode_sampling import get_vp_ode_sampler, VARIANTS
+  if sampler_name.lower() in ('ode_heun', 'ode_dpmpp_2m', 'ode_edm_heun'):
+    from ode_sampling import get_vp_ode_sampler, time_grid_for, VARIANTS
     if (not endpoint_variants or not config.training.continuous or
         not config.sampling.probability_flow or not config.sampling.noise_removal or
         config.sampling.corrector.lower() != 'none' or
-        config.sampling.time_grid != 'uniform_logsnr' or
+        config.sampling.time_grid != time_grid_for(sampler_name.lower()) or
         tuple(getattr(config.eval, 'endpoint_denoise_outputs', ())) != VARIANTS or
         bool(getattr(config.eval, 'splice_enabled', False))):
       raise ValueError('VP ODE methods require continuous PF-ODE, no corrector/splice, '
-                       'uniform-logSNR, explicit endpoint denoise and x_t/tweedie_xt outputs.')
+                       'their own grid (uniform-logSNR; Karras for EDM Heun), explicit '
+                       'endpoint denoise and x_t/tweedie_xt outputs.')
     return get_vp_ode_sampler(sde, shape, inverse_scaler, sampler_name.lower(), eps, config.device)
   if endpoint_variants and sampler_name.lower() != 'pc':
     raise ValueError('Endpoint denoise variants require the PC sampler.')
