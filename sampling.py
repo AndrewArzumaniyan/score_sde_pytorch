@@ -97,12 +97,15 @@ def get_sampling_fn(config, sde, shape, inverse_scaler, eps):
   endpoint_variants = bool(getattr(config.eval, 'endpoint_denoise_variants', False))
   if sampler_name.lower() in ('ode_heun', 'ode_dpmpp_2m', 'ode_edm_heun'):
     from ode_sampling import get_vp_ode_sampler, time_grid_for, VARIANTS
+    # SplicedEpsModel checks one network call per node, which only DPM++ makes.
+    splice_allowed = (sampler_name.lower() == 'ode_dpmpp_2m' and
+                      bool(getattr(config.eval, 'splice_allow_ode', False)))
     if (not endpoint_variants or not config.training.continuous or
         not config.sampling.probability_flow or not config.sampling.noise_removal or
         config.sampling.corrector.lower() != 'none' or
         config.sampling.time_grid != time_grid_for(sampler_name.lower()) or
         tuple(getattr(config.eval, 'endpoint_denoise_outputs', ())) != VARIANTS or
-        bool(getattr(config.eval, 'splice_enabled', False))):
+        (bool(getattr(config.eval, 'splice_enabled', False)) and not splice_allowed)):
       raise ValueError('VP ODE methods require continuous PF-ODE, no corrector/splice, '
                        'their own grid (uniform-logSNR; Karras for EDM Heun), explicit '
                        'endpoint denoise and x_t/tweedie_xt outputs.')
