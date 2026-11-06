@@ -139,20 +139,14 @@ def training_config(model):
     return config
 
 
-def get_config(name):
-    if name not in CELLS:
-        raise ValueError('Unknown stage 0 cell: ' + name)
-    spec = CELLS[name]
-    model = spec['model']
-    if model in TRAINED_ON_LO and spec['window'] != 'lo':
-        raise ValueError('A-G are evaluated only inside their training support.')
-    config = native_config(model) if model in ('vp', 'fox') else training_config(model)
+def set_protocol(config, window, ckpt):
+    """The stage 0 sampling protocol, shared with celeba_kappa_eval.py."""
     set_device(config)
     config.sampling.method = METHOD
     config.sampling.probability_flow = True
     config.sampling.time_grid = 'uniform_logsnr'
     config.sampling.logsnr_min = LOGSNR_MIN
-    config.sampling.logsnr_max = WINDOWS[spec['window']]
+    config.sampling.logsnr_max = WINDOWS[window]
     config.sampling.noise_removal = True
     config.sampling.predictor = 'none'  # The ODE method owns its stages.
     config.sampling.corrector = 'none'
@@ -166,11 +160,22 @@ def get_config(name):
     config.eval.enable_loss = False
     config.eval.enable_bpd = False
     config.eval.enable_sampling = True
-    config.eval.begin_ckpt = config.eval.end_ckpt = spec['ckpt']
+    config.eval.begin_ckpt = config.eval.end_ckpt = ckpt
     config.eval.include_final_checkpoint = False
     config.allow_tf32 = True
     config.cudnn_benchmark = True
     config.allow_fp16_reduced_precision_reduction = False
+
+
+def get_config(name):
+    if name not in CELLS:
+        raise ValueError('Unknown stage 0 cell: ' + name)
+    spec = CELLS[name]
+    model = spec['model']
+    if model in TRAINED_ON_LO and spec['window'] != 'lo':
+        raise ValueError('A-G are evaluated only inside their training support.')
+    config = native_config(model) if model in ('vp', 'fox') else training_config(model)
+    set_protocol(config, spec['window'], spec['ckpt'])
     if spec['route']:
         alternate = native_config('fox')
         set_device(alternate)
