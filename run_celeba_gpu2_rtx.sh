@@ -41,7 +41,8 @@ inception=c4be6b55dc0338e82546082d22184ebdc77d76cf
 
 free_mib() { nvidia-smi -i "$1" --query-gpu=memory.free --format=csv,noheader,nounits; }
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }
-state() { docker inspect --format '{{.State.Running}}' "$after" 2>/dev/null || echo gone; }
+# Docker 29 prints an empty line for an unknown name, so only the exit code tells.
+state() { local value; if value="$(docker inspect --format '{{.State.Running}}' "$after" 2>/dev/null)"; then echo "$value"; else echo gone; fi; }
 
 if [[ "$mode" == _wait ]]; then
   gpu="$1"
@@ -49,7 +50,7 @@ if [[ "$mode" == _wait ]]; then
   while [[ "$(state)" == true ]]; do
     sleep "$wait_seconds"
   done
-  code="$(docker inspect --format '{{.State.ExitCode}}' "$after" 2>/dev/null || echo unknown)"
+  code="$(docker inspect --format '{{.State.ExitCode}}' "$after" 2>/dev/null)" || code=unknown
   echo "$(stamp) $after stopped, exit code $code; the queue starts regardless"
   until (( "$(free_mib "$gpu")" >= min_free_mib )); do
     echo "$(stamp) GPU $gpu has $(free_mib "$gpu") MiB free, need $min_free_mib"
