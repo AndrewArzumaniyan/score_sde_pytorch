@@ -324,14 +324,15 @@ case "$1" in
     esac ;;
   run)
     name=""; prev=""; for arg in "$@"; do [[ "$prev" == --name ]] && name="$arg"; prev="$arg"; done
-    echo "run $name" >> "$STATE/events"
+    echo "run $name" >> "$STATE/events"; printf '%s\n' "$@" > "$STATE/$name.args"
     echo "${EVAL_POLLS:-2}" > "$STATE/$name.polls"; echo "${EVAL_CODE:-0}" > "$STATE/$name.code"; echo "1," > "$STATE/$name.gpus" ;;
 esac
 exit 0
 """
 STUBS = {
     'git': '#!/usr/bin/env bash\n[[ "$1" == rev-parse ]] && echo commit\nexit 0\n',
-    'nvidia-smi': '#!/usr/bin/env bash\necho "${FREE_MIB:-81000}"\n',
+    'nvidia-smi': ('#!/usr/bin/env bash\nif [[ "$*" == *name* ]]; then echo "${GPU_NAME:-NVIDIA RTX PRO 6000 Blackwell}"; '
+                   'else echo "${FREE_MIB:-81000}"; fi\n'),
     'df': '#!/usr/bin/env bash\necho "Filesystem 1 2 3 4"\necho "d 0 0 999999999999999 0"\n',
     'realpath': '#!/usr/bin/env bash\npython3 -c "import os, sys; print(os.path.realpath(sys.argv[-1]))" "$@"\n',
     'next': '#!/usr/bin/env bash\necho "afhqv2 $*" >> "$STATE/events"\n',
@@ -385,7 +386,7 @@ class AfterA(unittest.TestCase):
         return path.read_text().splitlines() if path.exists() else []
 
     def test_arguments(self):
-        for arguments in (('after', 'fox', '1'), ('after', 'a'), ('after', 'a', '1', '2'), ('after', 'a', 'x')):
+        for arguments in (('after', 'b', '1'), ('after', 'a'), ('after', 'a', '1', '2'), ('after', 'a', 'x')):
             self.assertEqual(self.launch(*arguments).returncode, 2, arguments)
         (self.state / 'celeba-a43-400k-rtx.polls').unlink()
         result = self.launch('after', 'a', '1')
@@ -449,6 +450,88 @@ class AfterA(unittest.TestCase):
 
     def test_low_memory_starts_nothing(self):
         self.assert_stops(b'refused to start', [], FREE_MIB='1000')
+
+
+class AfterFox(AfterA):
+    """Lane fox on the H200 beside the VP seed 43 training."""
+
+    H200 = dict(GPU_NAME='NVIDIA H200 NVL', PAIR43_ALLOWED_NEIGHBOURS='celeba-pair-seed43-h200')
+
+    def setUp(self):
+        super().setUp()
+        self.fox = self.base / 'celeba_pair_seed43_h200_20261106/workdirs'
+        (self.fox / 'celeba_fox_matern32_kappa1000_h200_seed43/checkpoints').mkdir(parents=True)
+        (self.fox / 'celeba_fox_matern32_kappa1000_h200_seed43/run_manifest.json').write_text('x')
+        self.training('celeba-pair-seed43-h200', polls=99, code=0, gpus='3,')
+
+    def finish_fox(self, checkpoint=True, vp=True):
+        if checkpoint:
+            (self.fox / 'celeba_fox_matern32_kappa1000_h200_seed43/checkpoints/checkpoint_160.pth').write_text('x')
+        if vp:
+            (self.fox / 'celeba_vp_continuous_h200_seed43').mkdir(exist_ok=True)
+            (self.fox / 'celeba_vp_continuous_h200_seed43/run_manifest.json').write_text('x')
+
+    def args(self, name):
+        return (self.state / (name + '.args')).read_text().splitlines()
+
+    def test_the_pair_training_blocks_the_card_unless_allowed_by_name(self):
+        self.assertIn(b'GPU 3 runs containers: celeba-pair-seed43-h200', self.launch('after', 'fox', '3').stdout)
+        other = dict(self.H200, PAIR43_ALLOWED_NEIGHBOURS='celeba-pair-seed43')
+        self.assertIn(b'runs containers: celeba-pair-seed43-h200', self.launch('after', 'fox', '3', **other).stdout)
+        self.training('celeba-other', polls=99, code=0, gpus='3,')
+        self.assertIn(b'runs containers: celeba-other', self.launch('after', 'fox', '3', **self.H200).stdout)
+
+    def test_waits_for_the_checkpoint_and_the_start_of_vp(self):
+        for checkpoint, vp in ((False, False), (True, False), (False, True)):
+            shutil.rmtree(str(self.fox / 'celeba_vp_continuous_h200_seed43'), ignore_errors=True)
+            path = self.fox / 'celeba_fox_matern32_kappa1000_h200_seed43/checkpoints/checkpoint_160.pth'
+            if path.exists():
+                path.unlink()
+            self.finish_fox(checkpoint, vp)
+            result = self.launch('_wait_fox', '3', PAIR43_WAIT_MAX_SECONDS='0', **self.H200)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(b'has not finished; nothing started', result.stdout)
+        self.assertEqual(self.events(), [])
+
+    def test_h200_lane_uses_sm_90_and_its_own_extension_cache(self):
+        self.finish_fox()
+        result = self.launch('_wait_fox', '3', **self.H200)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.events(), ['run celeba-pair43-lo-fox'])
+        args = self.args('celeba-pair43-lo-fox')
+        self.assertIn('TORCH_CUDA_ARCH_LIST=9.0', args)
+        self.assertIn('device=3', args)
+        self.assertIn('TORCH_EXTENSIONS_DIR=/workspace/score_sde_pytorch/.torch_extensions_h200', args)
+        mounts = [arg for arg in args if 'torch_extensions' in arg or '.cache_' in arg]
+        self.assertTrue(all('celeba_pair43_lo_20261109/fox/' in arg for arg in mounts if arg.startswith('type=')), mounts)
+        self.assertFalse(any('_rtx' in arg for arg in args), args)
+
+    def test_after_fox_returns_at_once(self):
+        self.finish_fox()
+        self.assertIn(b'Waiting for FOX seed 43', self.launch('after', 'fox', '3', **self.H200).stdout)
+        for _ in range(100):
+            if self.events():
+                break
+            time.sleep(0.1)
+        self.assertEqual(self.events(), ['run celeba-pair43-lo-fox'])
+
+    def test_rtx_lane_a_is_unchanged(self):
+        self.assertEqual(self.launch('_wait', '1').returncode, 0)
+        args = self.args('celeba-pair43-lo-a')
+        self.assertIn('TORCH_CUDA_ARCH_LIST=12.0', args)
+        self.assertIn('TORCH_EXTENSIONS_DIR=/workspace/score_sde_pytorch/.torch_extensions_rtx', args)
+        self.assertTrue(any(arg.endswith('score_sde_pytorch/.torch_extensions_rtx,dst=/workspace/score_sde_pytorch/'
+                                         '.torch_extensions_rtx') for arg in args), args)
+
+    def test_unknown_card_is_refused(self):
+        self.finish_fox()
+        result = self.launch('_wait_fox', '3', GPU_NAME='NVIDIA A100', PAIR43_ALLOWED_NEIGHBOURS='celeba-pair-seed43-h200')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b'neither an RTX nor an H200', result.stdout)
+
+    def test_arguments(self):
+        for arguments in (('after', 'fox'), ('after', 'fox', '3', '4'), ('after', 'fox', 'x')):
+            self.assertEqual(self.launch(*arguments, **self.H200).returncode, 2, arguments)
 
 
 if __name__ == '__main__':

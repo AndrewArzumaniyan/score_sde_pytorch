@@ -7,6 +7,16 @@
 #   bash run_celeba_pair43_lo_rtx.sh queue a|fox GPU_ID   detached queue: preflight, then the cells of that lane
 #   bash run_celeba_pair43_lo_rtx.sh after a GPU_ID       in the background: wait for $PAIR43_AFTER to stop,
 #                                                         then lane a, then AFHQv2 A and VP on the same GPU
+#   bash run_celeba_pair43_lo_rtx.sh after fox GPU_ID     in the background: wait for FOX seed 43 checkpoint_160
+#                                                         and the start of VP seed 43, then lane fox
+#
+# A queue refuses a GPU that runs a container of ours, except those named in
+# PAIR43_ALLOWED_NEIGHBOURS (comma-separated). Lane fox on the H200 beside the pair training:
+#
+#   PAIR43_ALLOWED_NEIGHBOURS=celeba-pair-seed43-h200 bash run_celeba_pair43_lo_rtx.sh after fox 3
+#
+# On an H200 the queue builds the extensions for sm 9.0 into a cache of its own under the
+# output, so the RTX cache of running jobs stays as it is. The image is the same.
 #
 # after a: the training must exit with code 0 and leave checkpoint_8 and its manifest; the
 # lane a must exit with code 0 and a summary without failed cells. Otherwise nothing more
@@ -21,7 +31,7 @@
 # After any change to the code, use a new PAIR43_OUTPUT and recompute the cells.
 set -euo pipefail
 
-mode="${1:?Usage: bash run_celeba_pair43_lo_rtx.sh check|queue a|fox GPU_ID|after a GPU_ID}"
+mode="${1:?Usage: bash run_celeba_pair43_lo_rtx.sh check|queue a|fox GPU_ID|after a|fox GPU_ID}"
 shift
 source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 base="${PAIR43_SERVER_BASE:-/home/e.nuzhin/kovshov-arzumanyan}"
@@ -40,6 +50,9 @@ eval_max_seconds="${PAIR43_EVAL_MAX_SECONDS:-28800}"
 root=/workspace/score_sde_pytorch
 inception=c4be6b55dc0338e82546082d22184ebdc77d76cf
 a_work=celeba_ab_replication_A_vp_pvp_400k_rtx_seed43
+fox_work=celeba_fox_matern32_kappa1000_h200_seed43
+fox_next_work="${PAIR43_FOX_NEXT_WORK:-celeba_vp_continuous_h200_seed43}"  # Appears once FOX has passed its verify.
+allowed="${PAIR43_ALLOWED_NEIGHBOURS:-}"
 
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }
 # Docker 29 prints an empty line for an unknown name, so only the exit code tells.
@@ -56,6 +69,31 @@ gpu_containers() {
     [[ ",$ids" != *",$1,"* ]] || echo "$name"
   done
 }
+# Those of them not named in PAIR43_ALLOWED_NEIGHBOURS or in the second argument.
+not_allowed() {
+  local name
+  while read -r name; do
+    [[ -z "$name" || ",$allowed,$2," == *",$name,"* ]] || echo "$name"
+  done < <(gpu_containers "$1")
+}
+
+if [[ "$mode" == _wait_fox ]]; then
+  gpu="${1:?Expected a physical GPU index.}"
+  checkpoint="$fox_run/workdirs/$fox_work/checkpoints/checkpoint_160.pth"
+  marker="$fox_run/workdirs/$fox_next_work/run_manifest.json"
+  echo "$(stamp) waiting for $checkpoint and $marker, then lane fox on GPU $gpu, at most $wait_max_seconds s"
+  # Checkpoints are renamed into place, so an existing file is complete.
+  until [[ -s "$checkpoint" && -s "$marker" ]]; do
+    (( SECONDS < wait_max_seconds )) || { echo "$(stamp) waited $SECONDS s: FOX seed 43 has not finished; nothing started"; exit 1; }
+    sleep "$wait_seconds"
+  done
+  echo "$(stamp) FOX seed 43 finished and VP seed 43 started"
+  if ! bash "$source_dir/run_celeba_pair43_lo_rtx.sh" queue fox "$gpu"; then
+    echo "$(stamp) lane fox refused to start; nothing started"; exit 1
+  fi
+  echo "$(stamp) launcher finished"
+  exit 0
+fi
 
 if [[ "$mode" == _wait ]]; then
   gpu="${1:?Expected a physical GPU index.}"
@@ -115,8 +153,28 @@ if [[ "$mode" == check ]]; then
     --entrypoint python "$image_id" tests/check_celeba_pair43_lo.py
 fi
 
+if [[ "$mode" == after && "${1:-}" == fox ]]; then
+  [[ $# -eq 2 && "$2" =~ ^[0-9]+$ ]] || { echo 'Usage: after fox GPU_ID' >&2; exit 2; }
+  gpu="$2"
+  if docker inspect celeba-pair43-lo-fox >/dev/null 2>&1; then
+    echo 'Container exists: celeba-pair43-lo-fox. Inspect it and remove it before restarting.' >&2; exit 1
+  fi
+  busy="$(not_allowed "$gpu" "")"
+  [[ -z "$busy" ]] || { echo "GPU $gpu runs containers: $busy. Name allowed ones in PAIR43_ALLOWED_NEIGHBOURS." >&2; exit 1; }
+  mkdir -p "$output_root/fox/logs"
+  pid_file="$output_root/fox/logs/wait.pid"
+  if [[ -s "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    echo "Already waiting: process $(cat "$pid_file")." >&2; exit 1
+  fi
+  log="$output_root/fox/logs/wait_$(date -u +%Y%m%dT%H%M%SZ).log"
+  nohup bash "$source_dir/run_celeba_pair43_lo_rtx.sh" _wait_fox "$gpu" >> "$log" 2>&1 < /dev/null &
+  echo "$!" > "$pid_file"
+  echo "Waiting for FOX seed 43 in process $!. Log: $log"
+  exit 0
+fi
+
 if [[ "$mode" == after ]]; then
-  [[ "${1:-}" == a && $# -eq 2 ]] || { echo 'Usage: after a GPU_ID' >&2; exit 2; }
+  [[ "${1:-}" == a && $# -eq 2 ]] || { echo 'Usage: after a|fox GPU_ID' >&2; exit 2; }
   gpu="$2"
   [[ "$gpu" =~ ^[0-9]+$ ]] || { echo 'Expected a physical GPU index.' >&2; exit 2; }
   # A misspelt name would otherwise count as stopped and start on a busy GPU.
@@ -127,7 +185,7 @@ if [[ "$mode" == after ]]; then
     fi
   done
   [[ -s "$next_launcher" ]] || { echo "Missing AFHQv2 launcher: $next_launcher" >&2; exit 1; }
-  busy="$(gpu_containers "$gpu" | grep -v -x -e "$after" || true)"
+  busy="$(not_allowed "$gpu" "$after")"
   [[ -z "$busy" ]] || { echo "GPU $gpu runs containers: $busy" >&2; exit 1; }
   mkdir -p "$output_root/a/logs"
   pid_file="$output_root/a/logs/wait.pid"
@@ -147,7 +205,7 @@ gpu="${2:?Expected a physical GPU index.}"
 [[ "$gpu" =~ ^[0-9]+$ ]] || { echo 'Expected a physical GPU index.' >&2; exit 2; }
 case "$lane" in
   a) run_dir="$a_run"; work=celeba_ab_replication_A_vp_pvp_400k_rtx_seed43; ckpt=8 ;;
-  fox) run_dir="$fox_run"; work=celeba_fox_matern32_kappa1000_h200_seed43; ckpt=160 ;;
+  fox) run_dir="$fox_run"; work="$fox_work"; ckpt=160 ;;
   *) echo 'Expected a lane: a or fox.' >&2; exit 2 ;;
 esac
 name="celeba-pair43-lo-$lane"
@@ -167,17 +225,26 @@ for path in "$main/assets/stats/celeba_64_0c2d89311192_stats.npz" "$main/celeba/
 done
 available="$(df -PB1 "$output" | awk 'NR==2 {print $4}')"
 (( available >= 30 * 1024 * 1024 * 1024 )) || { echo 'Need at least 30 GiB free.' >&2; exit 1; }
-busy="$(gpu_containers "$gpu")"
-[[ -z "$busy" ]] || { echo "GPU $gpu runs containers: $busy" >&2; exit 1; }
+busy="$(not_allowed "$gpu" "")"
+[[ -z "$busy" ]] || { echo "GPU $gpu runs containers: $busy. Name allowed ones in PAIR43_ALLOWED_NEIGHBOURS." >&2; exit 1; }
+# The image serves both cards; an H200 needs sm 9.0 and must not rebuild the RTX cache.
+gpu_name="$(nvidia-smi -i "$gpu" --query-gpu=name --format=csv,noheader)"
+case "$gpu_name" in
+  *RTX*) arch=12.0; extensions="$main/.torch_extensions_rtx"; extensions_dst=.torch_extensions_rtx
+         cache="$main/.cache_rtx"; cache_dst=.cache_rtx ;;
+  *H200*) arch=9.0; extensions="$output/.torch_extensions_h200"; extensions_dst=.torch_extensions_h200
+          cache="$output/.cache_h200"; cache_dst=.cache_h200; mkdir -p "$extensions" "$cache" ;;
+  *) echo "GPU $gpu is neither an RTX nor an H200: $gpu_name" >&2; exit 1 ;;
+esac
 # Free memory, not an empty card: other people may hold part of it.
 free="$(nvidia-smi -i "$gpu" --query-gpu=memory.free --format=csv,noheader,nounits)"
 (( free >= min_free_mib )) || { echo "GPU $gpu has $free MiB free, need $min_free_mib." >&2; exit 1; }
 
 # Bind targets inside a read-only source mount must already exist as directories.
-mkdir -p celeba workdirs logs assets/stats .tfds .torch_extensions_rtx .cache_rtx
+mkdir -p celeba workdirs logs assets/stats .tfds .torch_extensions_rtx .cache_rtx .torch_extensions_h200 .cache_h200
 run_id="$(date -u +%Y%m%dT%H%M%SZ)"
-printf 'container=%s\nphysical_gpu=%s\nimage_id=%s\nsource=%s\ncommit=%s\n' \
-  "$name" "$gpu" "$image_id" "$source_dir" "$(git rev-parse HEAD)" > "$output/logs/launch_$run_id.txt"
+printf 'container=%s\nphysical_gpu=%s\ngpu_name=%s\narch=%s\nimage_id=%s\nsource=%s\ncommit=%s\n' \
+  "$name" "$gpu" "$gpu_name" "$arch" "$image_id" "$source_dir" "$(git rev-parse HEAD)" > "$output/logs/launch_$run_id.txt"
 
 # Preflight exits 1 when a cell failed; the queue then exits 1 itself.
 docker run -d --name "$name" --gpus "device=$gpu" --ipc=host --shm-size=16g \
@@ -187,13 +254,13 @@ docker run -d --name "$name" --gpus "device=$gpu" --ipc=host --shm-size=16g \
   --mount "type=bind,src=$main/celeba,dst=$root/celeba,readonly" \
   --mount "type=bind,src=$main/assets/stats,dst=$root/assets/stats,readonly" \
   --mount "type=bind,src=$main/.tfds,dst=$root/.tfds" \
-  --mount "type=bind,src=$main/.torch_extensions_rtx,dst=$root/.torch_extensions_rtx" \
-  --mount "type=bind,src=$main/.cache_rtx,dst=$root/.cache_rtx" \
+  --mount "type=bind,src=$extensions,dst=$root/$extensions_dst" \
+  --mount "type=bind,src=$cache,dst=$root/$cache_dst" \
   --mount "type=bind,src=$run_dir/workdirs/$work/checkpoints,dst=$root/workdirs/$work/checkpoints,readonly" \
   --workdir "$root" --env CUDA_VISIBLE_DEVICES=0 --env PYTHONDONTWRITEBYTECODE=1 \
-  --env TFDS_DATA_DIR="$root/.tfds" --env TORCH_EXTENSIONS_DIR="$root/.torch_extensions_rtx" \
-  --env XDG_CACHE_HOME="$root/.cache_rtx" --env TFHUB_CACHE_DIR="$root/workdirs/_tfhub_modules" \
-  --env TORCH_CUDA_ARCH_LIST=12.0 --env MAX_JOBS=8 \
+  --env TFDS_DATA_DIR="$root/.tfds" --env TORCH_EXTENSIONS_DIR="$root/$extensions_dst" \
+  --env XDG_CACHE_HOME="$root/$cache_dst" --env TFHUB_CACHE_DIR="$root/workdirs/_tfhub_modules" \
+  --env TORCH_CUDA_ARCH_LIST="$arch" --env MAX_JOBS=8 \
   --entrypoint bash "$image_id" -c "
     { python -u celeba_pair43_lo_eval.py preflight $lane; python -u celeba_pair43_lo_eval.py queue $lane
     } 2>&1 | tee -a logs/${lane}_$run_id.log; exit \${PIPESTATUS[0]}"

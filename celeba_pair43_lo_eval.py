@@ -9,6 +9,9 @@ Two independent lanes share no files: a and fox, each with its own workdirs and 
 whichever GPU is free. Contrasts between A and FOX therefore come from reading both
 summaries. Compare them inside this pair only: the May pair ran under other code. A seed 43
 went from 200k to 400k on an RTX PRO 6000 with TF32; FOX seed 43 trained on an H200.
+The lanes are also evaluated on different hardware: lane a on an RTX PRO 6000, lane fox on
+the H200 next to the VP seed 43 training, with the same image and code. So the contrast
+inside this pair spans two evaluation devices, and absolute FID of the pairs is not compared.
 
 The checkpoints did not exist when this was written, so their ids are not fixed in advance.
 Preflight checks the step, the model protocol and the training protocol of the run manifest,
