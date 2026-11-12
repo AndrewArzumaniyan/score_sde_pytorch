@@ -13,7 +13,9 @@ so the queue waits for it on the same GPU without holding the card's memory.
 
 There is no reference value in this protocol for AFHQv2, so there is no control cell.
 Preflight checks the statistics file, the step and the training protocol of every model,
-the grid and a short real run. One training run per model, one sampling seed, 10k
+the grid and a short real run, and passes one batch of 512 images of the first model
+through the same evaluate_checkpoint the cells use, Inception and FID included. The first
+launch skipped that path and every cell then failed on a dataset check inside it. One training run per model, one sampling seed, 10k
 images: a screen without intervals. The choice of step follows AFHQV2_STEP_RULE.md.
 
 Run through run_afhqv2_curve_rtx.sh from a separate worktree.
@@ -136,6 +138,31 @@ def load_model(config, spec):
     return model, dict(checkpoint_id=state['checkpoint_id'], step=int(state['step']))
 
 
+def endpoint_smoke(config, model, spec, directory):
+    """One batch through the evaluation path of the cells: sampler, Inception, statistics, FID."""
+    import numpy as np
+    import datasets
+    import endpoint_denoise_eval
+    import evaluation
+    import sampling
+    from run_lib import get_sde
+    config = config.copy_and_resolve_references()
+    config.eval.num_samples = config.eval.batch_size
+    sde, eps = get_sde(config, n_override=CALLS)
+    shape = (config.eval.batch_size, config.data.num_channels, config.data.image_size, config.data.image_size)
+    sampling_fn = sampling.get_sampling_fn(config, sde, shape, datasets.get_data_inverse_scaler(config), eps)
+    identity = dict(protocol_sha256=np.asarray('preflight'), checkpoint_id=np.asarray('preflight'),
+                    checkpoint_step=np.asarray(spec['step']), training_protocol_sha256=np.asarray('preflight'))
+    endpoint_denoise_eval.evaluate_checkpoint(
+        config, str(directory), spec['ckpt'], model, sampling_fn, evaluation.get_inception_model(), 'preflight',
+        'preflight', spec['step'], 'preflight', identity)
+    with np.load(str(directory / 'report_{}.npz'.format(spec['ckpt'])), allow_pickle=False) as data:
+        value = float(data['fid_tweedie_xt'])
+    if not math.isfinite(value):
+        raise RuntimeError('Non-finite FID in the endpoint smoke.')
+    return value
+
+
 def preflight():
     """Statistics, then each model at its first cell in the order: grid, weights, short run."""
     import torch
@@ -157,7 +184,7 @@ def preflight():
     config = get_config(first['fox'])
     afhq.check_stats(config)
     stats_id = evaluation.dataset_stats_fingerprint(config)
-    identities, failures = {}, {}
+    identities, failures, smoke_fid = {}, {}, None
     for arm, name in first.items():
         spec = CELLS[name]
         try:
@@ -166,14 +193,24 @@ def preflight():
             stage0.check_grid(config, sde, eps)
             model, identities[name] = load_model(config, spec)
             followup.smoke(config, model, stage0.METHOD, eps)
+            if smoke_fid is None:
+                import shutil
+                directory = LOGS / 'preflight_endpoint'
+                shutil.rmtree(str(directory), ignore_errors=True)
+                smoke_fid = endpoint_smoke(config, model, spec, directory)
+                shutil.rmtree(str(directory), ignore_errors=True)
+                print('Preflight endpoint path {}: FID after Tweedie on 512 images {:.2f}'.format(name, smoke_fid),
+                      flush=True)
             del model
             torch.cuda.empty_cache()
             print('Preflight', name, identities[name], flush=True)
         except Exception as error:  # A truncated checkpoint raises whatever torch.load does.
             failures[arm] = repr(error)
             print('Preflight failed: {}: {!r}'.format(name, error), flush=True)
+    if smoke_fid is None:
+        failures['endpoint'] = 'No model passed the endpoint smoke.'
     write_json(path, dict(status='failed' if failures else 'passed', checkpoints=identities, failures=failures,
-        dataset_stats_id=stats_id, source_sha256=_source_fingerprint(str(ROOT)), environment=_environment_manifest(),
+        endpoint_smoke_fid_512=smoke_fid, dataset_stats_id=stats_id, source_sha256=_source_fingerprint(str(ROOT)), environment=_environment_manifest(),
         started_unix=time.time()))
     print('Preflight', 'failed: {}'.format(failures) if failures else 'passed', flush=True)
     return 1 if failures else 0

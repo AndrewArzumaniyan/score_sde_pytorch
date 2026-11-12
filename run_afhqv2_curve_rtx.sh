@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Host launcher: AFHQv2-64, FOX, A and VP over training steps (afhqv2_curve_eval.py); the step
 # rule is AFHQV2_STEP_RULE.md. Run from a clean, separate Git worktree, by default
-# ~/kovshov-arzumanyan/arzumand/score_sde_afhqv2_curve_20261111.
+# ~/kovshov-arzumanyan/arzumand/score_sde_afhqv2_curve_r2_20261112.
 #
 #   bash run_afhqv2_curve_rtx.sh check              CPU tests and input paths; no GPU
 #   bash run_afhqv2_curve_rtx.sh start GPU_ID       detached: preflight, then nine cells, each as its snapshot appears
@@ -20,7 +20,9 @@ source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 base="${AFHQ_CURVE_SERVER_BASE:-/home/e.nuzhin/kovshov-arzumanyan}"
 main="${AFHQ_CURVE_MAIN:-$base/score_sde_pytorch}"
 runs="${AFHQ_CURVE_RUNS:-$base/afhqv2_rtx_20261108/workdirs}"
-output="${AFHQ_CURVE_OUTPUT:-$base/afhqv2_curve_20261112}"
+# The first output, afhqv2_curve_20261112, holds the launch that failed on a dataset check
+# inside evaluate_checkpoint; this one starts clean.
+output="${AFHQ_CURVE_OUTPUT:-$base/afhqv2_curve_20261112_r2}"
 tfhub="${AFHQ_CURVE_TFHUB:-$base/celeba_50k_lo_20261107/gpu2/workdirs/_tfhub_modules}"
 image="${AFHQ_CURVE_IMAGE:-score-sde-rtx:latest}"
 after="${AFHQ_CURVE_AFTER:-afhqv2-rtx-a-vp}"
@@ -82,8 +84,8 @@ cd "$source_dir"
 [[ "$(realpath "$source_dir")" != "$(realpath -m "$main")" ]] || {
   echo 'Run from a separate worktree, not from the training checkout.' >&2; exit 1; }
 for path in afhqv2_curve_eval.py afhqv2_rtx_train.py celeba_pair_seed.py celeba_50k_lo_eval.py celeba_followup_eval.py \
-    celeba_kappa_eval.py celeba_matched35_rtx_eval.py celeba_stage0_eval.py AFHQV2_STEP_RULE.md \
-    run_afhqv2_curve_rtx.sh tests/check_afhqv2_curve.py; do
+    celeba_kappa_eval.py celeba_matched35_rtx_eval.py celeba_stage0_eval.py endpoint_denoise_eval.py \
+    AFHQV2_STEP_RULE.md run_afhqv2_curve_rtx.sh tests/check_afhqv2_curve.py; do
   git ls-files --error-unmatch "$path" >/dev/null 2>&1 || {
     echo "Not committed: $path." >&2; exit 1; }
 done

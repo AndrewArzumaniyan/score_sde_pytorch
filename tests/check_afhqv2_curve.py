@@ -26,6 +26,7 @@ if importlib.util.find_spec('tensorflow') is None:  # Outside the Docker image.
 import afhqv2_curve_eval as curve
 import afhqv2_rtx_train as afhq
 import celeba_stage0_eval as stage0
+import run_lib  # noqa: F401, imported before tests patch torch.cuda.is_available.
 from artifact_utils import _canonicalize, build_model_manifest
 
 LO = 9.115429865459795
@@ -212,6 +213,86 @@ class Selection(unittest.TestCase):
         result = curve.selection(cells)
         self.assertEqual(sorted(result['selected']), ['A', 'VP'])
         self.assertNotIn('fox_minus_best_baseline', result)
+
+
+class EndpointPath(Base):
+    """The first launch failed in endpoint_denoise_eval on a dataset check that no test reached."""
+
+    def test_endpoint_evaluation_accepts_afhqv2_64(self):
+        import endpoint_denoise_eval
+        for name in curve.CELLS:
+            config = curve.get_config(name)
+            config.eval.batch_size = 0  # Stops right after the dataset check, before any sampling.
+            with self.assertRaisesRegex(ValueError, 'must be positive'):
+                endpoint_denoise_eval.evaluate_checkpoint(config, str(self.root), 4, None, None, None, 'p', 'c', 1, 't', {})
+
+    def test_the_other_datasets_are_still_accepted_and_others_refused(self):
+        import endpoint_denoise_eval
+        config = curve.get_config('fox_c4_lo')
+        config.eval.batch_size = 0
+        for dataset, size, message in (('CELEBA', 64, 'must be positive'), ('CIFAR10', 32, 'must be positive'),
+                                       ('AFHQV2', 32, 'supports'), ('LSUN', 64, 'supports')):
+            config.data.dataset, config.data.image_size = dataset, size
+            with self.assertRaisesRegex(ValueError, message):
+                endpoint_denoise_eval.evaluate_checkpoint(config, str(self.root), 4, None, None, None, 'p', 'c', 1, 't', {})
+
+    def test_endpoint_smoke_runs_one_batch_of_the_cell_protocol(self):
+        import endpoint_denoise_eval
+        import evaluation
+        seen = {}
+
+        def evaluate(config, directory, ckpt, model, sampling_fn, inception, *rest):
+            seen.update(samples=config.eval.num_samples, batch=config.eval.batch_size, ckpt=ckpt,
+                        window=config.sampling.logsnr_max, dataset=config.data.dataset, fn=callable(sampling_fn))
+            Path(directory).mkdir(parents=True, exist_ok=True)
+            np.savez(str(Path(directory) / 'report_{}.npz'.format(ckpt)), fid_tweedie_xt=np.asarray(40.0))
+
+        spec = curve.CELLS['fox_c4_lo']
+        config = curve.get_config('fox_c4_lo')
+        config.device = 'cpu'
+        with patch.object(endpoint_denoise_eval, 'evaluate_checkpoint', evaluate), \
+                patch.object(evaluation, 'get_inception_model', lambda: 'inception'):
+            value = curve.endpoint_smoke(config, 'model', spec, self.root / 'smoke')
+        self.assertEqual(value, 40.0)
+        self.assertEqual(seen, dict(samples=512, batch=512, ckpt=4, window=LO, dataset='AFHQV2', fn=True))
+        self.assertEqual(curve.get_config('fox_c4_lo').eval.num_samples, 10000)  # The cell config is untouched.
+
+    def run_preflight(self, smoke):
+        def load(config, spec):
+            return 'model', dict(checkpoint_id='id', step=spec['step'])
+
+        original = curve.get_config
+
+        def on_cpu(name):
+            config = original(name)
+            config.device = 'cpu'
+            return config
+
+        with patch('torch.cuda.is_available', lambda: True), patch('torch.cuda.device_count', lambda: 1), \
+                patch('torch.cuda.get_device_capability', lambda i: (12, 0)), patch('torch.cuda.empty_cache'), \
+                patch.dict(os.environ, TORCH_CUDA_ARCH_LIST='12.0'), patch.object(curve.lo, 'check_inception'), \
+                patch.object(afhq, 'check_stats'), patch('evaluation.dataset_stats_fingerprint', lambda c: STATS_ID), \
+                patch('artifact_utils._environment_manifest', lambda: {}), \
+                patch('artifact_utils._source_fingerprint', lambda root: 'source'), \
+                patch.object(curve, 'get_config', on_cpu), patch.object(curve, 'load_model', load), \
+                patch.object(curve.followup, 'smoke'), patch.object(curve, 'endpoint_smoke', side_effect=smoke) as call:
+            code = curve.preflight()
+        return code, json.loads((curve.LOGS / 'preflight.json').read_text()), call
+
+    def test_preflight_passes_the_endpoint_path_once(self):
+        code, saved, call = self.run_preflight(lambda *a: 42.0)
+        self.assertEqual((code, saved['status'], saved['endpoint_smoke_fid_512']), (0, 'passed', 42.0))
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(call.call_args[0][2], curve.CELLS['fox_c4_lo'])
+
+    def test_preflight_fails_when_the_endpoint_path_fails(self):
+        def smoke(*args):
+            raise ValueError('Endpoint denoise evaluation supports CelebA 64 and CIFAR-10 32.')
+
+        code, saved, call = self.run_preflight(smoke)
+        self.assertEqual((code, saved['status']), (1, 'failed'))
+        self.assertEqual(sorted(saved['failures']), ['a', 'endpoint', 'fox', 'vp'])
+        self.assertEqual(call.call_count, 3)
 
 
 class Queue(Base):

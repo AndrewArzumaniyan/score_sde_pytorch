@@ -1,4 +1,4 @@
-"""Paired endpoint-denoise evaluation for VP/FOX on CelebA and CIFAR-10."""
+"""Paired endpoint-denoise evaluation for VP/FOX on CelebA 64, AFHQv2 64 and CIFAR-10 32."""
 import gc
 import logging
 import math
@@ -35,9 +35,11 @@ def evaluate_checkpoint(config, eval_dir, ckpt, score_model, sampling_fn,
                         checkpoint_step, training_protocol, artifact_identity,
                         extra_identity=None):
   """Generate three image outputs per trajectory and evaluate each identically."""
+  # Nothing below depends on the dataset except the reference statistics, which
+  # evaluation.load_dataset_stats resolves for each of these.
   if (config.data.dataset, config.data.image_size) not in (
-      ('CELEBA', 64), ('CIFAR10', 32)):
-    raise ValueError('Endpoint denoise evaluation supports CelebA 64 and CIFAR-10 32.')
+      ('CELEBA', 64), ('AFHQV2', 64), ('CIFAR10', 32)):
+    raise ValueError('Endpoint denoise evaluation supports CelebA 64, AFHQv2 64 and CIFAR-10 32.')
   variants = tuple(getattr(config.eval, 'endpoint_denoise_outputs', VARIANTS))
   if variants not in (VARIANTS, ('x_t', 'tweedie_xt')):
     raise ValueError('Unsupported endpoint output variants.')
